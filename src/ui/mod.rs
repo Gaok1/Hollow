@@ -964,9 +964,10 @@ fn primary_button_style(theme: Theme, hover: bool) -> Style {
             .bg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
+        // Azul médio para destacar como ação principal
         Style::default()
-            .fg(theme.text)
-            .bg(Color::Rgb(26, 30, 38))
+            .fg(theme.bg)
+            .bg(Color::Rgb(55, 105, 155))
             .add_modifier(Modifier::BOLD)
     }
 }
@@ -1493,29 +1494,31 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &mut AppState, theme: Them
 
     for ((label, tab), chunk) in tabs.into_iter().zip(sections.iter()) {
         let active = app.active_tab == tab;
-        let style = if active {
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD)
+        let (text_style, border_color) = if active {
+            (
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                theme.accent,
+            )
         } else {
-            Style::default().fg(theme.text).bg(theme.panel)
+            (
+                Style::default()
+                    .fg(theme.muted)
+                    .bg(Color::Rgb(22, 26, 33)),
+                theme.border,
+            )
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .style(Style::default().bg(theme.panel));
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(if active { theme.accent } else { Color::Rgb(22, 26, 33) }));
 
-        let hint = match tab {
-            ActiveTab::Transfers => "(1)",
-            ActiveTab::Downloads => "(2)",
-            ActiveTab::Events => "(3)",
-        };
-
-        let tab_widget = Paragraph::new(format!("{label} {hint}"))
+        let tab_widget = Paragraph::new(label)
             .alignment(Alignment::Center)
-            .style(style)
+            .style(text_style)
             .block(block);
 
         frame.render_widget(tab_widget, *chunk);
@@ -1553,7 +1556,7 @@ fn render_transfer_tab(
         .collect::<Vec<_>>();
 
     let selected = List::new(selected_items)
-        .block(block_with_title(theme, "arquivos (saída)"))
+        .block(block_with_title(theme, "Saida"))
         .style(Style::default().bg(theme.panel));
 
     frame.render_widget(selected, body[0]);
@@ -1576,7 +1579,7 @@ fn render_transfer_tab(
     }
 
     let received = List::new(received_items)
-        .block(block_with_title(theme, "recebendo (entrada)"))
+        .block(block_with_title(theme, "Entrada"))
         .style(Style::default().bg(theme.panel));
 
     app.received_click_targets = build_received_click_targets(list_area, &received_view);
@@ -1692,6 +1695,7 @@ fn render_transfer_tab(
 
 fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: Theme) {
     app.received_click_targets = Vec::new();
+    app.ui_click_targets = Vec::new();
 
     let layout = Layout::default()
         .direction(Direction::Horizontal)
@@ -1729,11 +1733,13 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: T
 
     frame.render_widget(summary, layout[0]);
 
-    // Reaproveita a lista de logs
+    // Barra de controle com botões clicáveis
     let log_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(layout[1]);
+
+    let hover = app.last_mouse;
 
     let query_text = if app.log_query.is_empty() {
         "(todas)".to_string()
@@ -1746,6 +1752,17 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: T
         theme.text
     };
 
+    let ctrl = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ])
+        .split(log_layout[0]);
+
     let filter_line = Line::from(vec![
         Span::styled("Filtro: ", Style::default().fg(theme.muted)),
         Span::styled(app.log_filter.label(), title_style(theme)),
@@ -1756,16 +1773,26 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: T
                 .fg(query_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "  (use botões na aba Transferências) ",
-            Style::default().fg(theme.muted),
-        ),
     ]);
 
     frame.render_widget(
-        Paragraph::new(filter_line).style(Style::default().bg(theme.panel)),
-        log_layout[0],
+        Paragraph::new(filter_line)
+            .block(subtle_block(theme))
+            .style(Style::default().bg(theme.panel)),
+        ctrl[0],
     );
+
+    let btn_search = render_small_ui_button(frame, ctrl[1], "Buscar", hover, theme);
+    let btn_filter = render_small_ui_button(frame, ctrl[2], "Filtro", hover, theme);
+    let btn_top    = render_small_ui_button(frame, ctrl[3], "Topo",   hover, theme);
+    let btn_bottom = render_small_ui_button(frame, ctrl[4], "Fundo",  hover, theme);
+
+    app.ui_click_targets = vec![
+        UiClickTarget { area: btn_search, action: UiAction::FocusSearch },
+        UiClickTarget { area: btn_filter, action: UiAction::CycleFilter },
+        UiClickTarget { area: btn_top,    action: UiAction::LogsTop },
+        UiClickTarget { area: btn_bottom, action: UiAction::LogsBottom },
+    ];
 
     app.logs_area = log_layout[1];
     app.set_logs_view_height(log_layout[1].height.saturating_sub(2) as usize);
@@ -1815,8 +1842,9 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
             Constraint::Min(0),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(13),
+            Constraint::Length(8),
+            Constraint::Length(8),
         ])
         .split(layout[0]);
 
@@ -1849,29 +1877,19 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
 
     let hover = app.last_mouse;
 
-    let btn_search = render_small_ui_button(frame, top[1], "Buscar", hover, theme);
-    let btn_filter = render_small_ui_button(frame, top[2], "Filtro", hover, theme);
-    let btn_top = render_small_ui_button(frame, top[3], "Topo", hover, theme);
-    let btn_bottom = render_small_ui_button(frame, top[4], "Fundo", hover, theme);
+    let btn_search  = render_small_ui_button(frame, top[1], "Buscar",    hover, theme);
+    let btn_filter  = render_small_ui_button(frame, top[2], "Filtro",    hover, theme);
+    let btn_refresh = render_small_ui_button(frame, top[3], "Atualizar", hover, theme);
+    let btn_top     = render_small_ui_button(frame, top[4], "Topo",      hover, theme);
+    let btn_bottom  = render_small_ui_button(frame, top[5], "Fundo",     hover, theme);
 
     // Em downloads: UI targets substituem os do logs
     app.ui_click_targets = vec![
-        UiClickTarget {
-            area: btn_search,
-            action: UiAction::FocusSearch,
-        },
-        UiClickTarget {
-            area: btn_filter,
-            action: UiAction::CycleFilter,
-        },
-        UiClickTarget {
-            area: btn_top,
-            action: UiAction::HistoryTop,
-        },
-        UiClickTarget {
-            area: btn_bottom,
-            action: UiAction::HistoryBottom,
-        },
+        UiClickTarget { area: btn_search,  action: UiAction::FocusSearch },
+        UiClickTarget { area: btn_filter,  action: UiAction::CycleFilter },
+        UiClickTarget { area: btn_refresh, action: UiAction::RefreshHistory },
+        UiClickTarget { area: btn_top,     action: UiAction::HistoryTop },
+        UiClickTarget { area: btn_bottom,  action: UiAction::HistoryBottom },
     ];
 
     let status_text = app
@@ -2085,16 +2103,17 @@ fn render_connection_panel(
 
     // Dica curta (sem depender de hotkey)
     let hint = if app.mouse_capture_enabled {
-        "Clique nos botões".to_string()
+        "cliques ativos".to_string()
     } else {
-        "Sem clique (aperte M)".to_string()
+        "cliques desativados".to_string()
     };
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Modo: ", Style::default().fg(theme.muted)),
+            Span::styled(" HOLLOW ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Modo: ", Style::default().fg(theme.muted)),
             chip(theme, app.mode_label(), theme.accent),
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(hint, Style::default().fg(theme.muted)),
         ]))
         .block(subtle_block(theme))
@@ -2121,7 +2140,7 @@ fn render_connection_panel(
         ])
         .split(rows[1]);
 
-    let input_title = "ip do parceiro";
+    let input_title = "IP do parceiro";
     let placeholder = if matches!(app.mode, IpMode::Ipv4) {
         "ex: 192.0.2.10:12345"
     } else {
@@ -2239,7 +2258,7 @@ fn render_connection_panel(
 
     frame.render_widget(
         Paragraph::new(local_line)
-            .block(block_with_title(theme, "meu IP"))
+            .block(block_with_title(theme, "IP local"))
             .style(Style::default().bg(theme.panel)),
         row_mid[0],
     );
@@ -2344,7 +2363,7 @@ fn render_connection_panel(
 
     frame.render_widget(
         Paragraph::new(status_line)
-            .block(block_with_title(theme, "status"))
+            .block(block_with_title(theme, "conexao"))
             .style(Style::default().bg(theme.panel)),
         row_status,
     );
@@ -2442,10 +2461,10 @@ fn render_transfer_action_buttons(
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(12),
             Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(6),
             Constraint::Min(0),
         ])
         .split(area);
@@ -2457,7 +2476,7 @@ fn render_transfer_action_buttons(
 
     let buttons = vec![
         Button {
-            label: "Adicionar".to_string(),
+            label: "+ Adicionar".to_string(),
             area: row[0],
             action: ButtonAction::AddFiles,
         },
