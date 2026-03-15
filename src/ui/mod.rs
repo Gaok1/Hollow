@@ -2319,7 +2319,7 @@ fn render_connection_panel(
 
     let (addr_text, addr_color) = if let Some(addr_str) = best_sharable_address(app) {
         (addr_str, theme.text)
-    } else if app.stun_status.is_some() {
+    } else if app.stun_status.as_deref() == Some("stun...") {
         ("detectando...".to_string(), theme.muted)
     } else if let Some(local_ip) = app.current_local_ip() {
         let text = match local_ip {

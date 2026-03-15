@@ -1248,7 +1248,14 @@ async fn handle_command(
                         publish_stun_result(stun_res, evt_tx);
                     }
                     Err(err) => {
-                        let _ = evt_tx.send(NetEvent::Log(format!("erro ao reconfigurar {err}")));
+                        let family_label = if addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                        let _ = evt_tx.send(NetEvent::Log(format!(
+                            "não é possível conectar a {addr}: esta máquina não suporta {family_label} ({err})"
+                        )));
+                        let _ = evt_tx.send(NetEvent::Log(format!(
+                            "dica: use --bind 0.0.0.0:0 para forçar IPv4 ou [::]:0 para IPv6"
+                        )));
+                        return Ok(false);
                     }
                 }
             }
