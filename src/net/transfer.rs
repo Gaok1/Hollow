@@ -3,7 +3,11 @@ use std::{
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
 };
 
 use quinn::{ReadError, RecvStream, VarInt};
@@ -14,9 +18,11 @@ use tokio::{
     task,
 };
 
-const TRANSFER_BUFFER_SIZE: usize = 256 * 1024;
+const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const PROGRESS_EMIT_BYTES: u64 = 1024 * 1024;
 const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const JOURNAL_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_CONCURRENT_STREAMS: usize = 4;
 
 use super::{
     NetCommand, NetEvent, OBSERVED_ENDPOINT_VERSION, PROTOCOL_VERSION, WireMessage,
@@ -478,6 +484,8 @@ async fn wait_for_resume_answer(
 }
 
 /// Envia os arquivos para o par conectado respeitando cancelamentos da UI.
+/// Implementa pipeline: envia todos os ResumeQuery de uma vez e processa
+/// arquivos em paralelo (até MAX_CONCURRENT_STREAMS streams simultâneas via semáforo).
 pub(crate) async fn send_files(
     connection: &quinn::Connection,
     _peer: SocketAddr,
@@ -487,10 +495,10 @@ pub(crate) async fn send_files(
     evt_tx: &Sender<NetEvent>,
     cmd_rx: &mut tokio_mpsc::UnboundedReceiver<NetCommand>,
     chunk_size: usize,
-    journal: std::sync::Arc<tokio::sync::Mutex<TransferJournal>>,
+    journal: Arc<tokio::sync::Mutex<TransferJournal>>,
 ) -> io::Result<SendResult> {
     let mut pending_cmds: Vec<NetCommand> = Vec::new();
-    let mut resume_cache: HashMap<u64, (u64, bool, Option<String>)> = HashMap::new();
+
     let _ = send_message(
         connection,
         &WireMessage::Hello {
@@ -499,6 +507,17 @@ pub(crate) async fn send_files(
         evt_tx,
     )
     .await;
+
+    // Fase 1: abrir todos os arquivos, coletar metadados, enviar todos os ResumeQuery.
+    struct FilePrepared {
+        file_id: u64,
+        name: String,
+        path: PathBuf,
+        size: u64,
+        file: File,
+    }
+
+    let mut prepared: Vec<FilePrepared> = Vec::new();
 
     for path in files {
         match handle_send_control(cmd_rx, &mut pending_cmds) {
@@ -519,7 +538,7 @@ pub(crate) async fn send_files(
             SendOutcome::Completed => {}
         }
 
-        let mut file = File::open(path).await?;
+        let file = File::open(path).await?;
         let metadata = file.metadata().await?;
         let size = metadata.len();
         let name = path
@@ -541,15 +560,47 @@ pub(crate) async fn send_files(
         )
         .await;
 
+        prepared.push(FilePrepared {
+            file_id,
+            name,
+            path: path.clone(),
+            size,
+            file,
+        });
+    }
+
+    if prepared.is_empty() {
+        return Ok(SendResult {
+            outcome: SendOutcome::Completed,
+            next_file_id,
+            pending_cmds,
+        });
+    }
+
+    // Fase 2: aguardar ResumeAnswer de cada arquivo e construir configuração de envio.
+    // Respostas podem chegar fora de ordem; o cache já trata isso.
+    struct FileSendConfig {
+        file_id: u64,
+        name: String,
+        path: PathBuf,
+        size: u64,
+        file: File,
+        offset: u64,
+    }
+
+    let mut resume_cache: HashMap<u64, (u64, bool, Option<String>)> = HashMap::new();
+    let mut send_configs: Vec<FileSendConfig> = Vec::new();
+
+    for prep in prepared {
         let (resume_offset, resume_ok, resume_reason) = match wait_for_resume_answer(
             cmd_rx,
             &mut pending_cmds,
             &mut resume_cache,
-            file_id,
+            prep.file_id,
         )
         .await
         {
-            Ok((offset, ok, reason)) => (offset.min(size), ok, reason),
+            Ok((offset, ok, reason)) => (offset.min(prep.size), ok, reason),
             Err(outcome) => {
                 return Ok(SendResult {
                     outcome,
@@ -562,161 +613,142 @@ pub(crate) async fn send_files(
         let offset = if resume_ok { resume_offset } else { 0 };
         if offset > 0 {
             let _ = evt_tx.send(NetEvent::Log(format!(
-                "retomando envio de {name} a partir do byte {offset} (file_id={file_id})"
+                "retomando envio de {} a partir do byte {offset} (file_id={})",
+                prep.name, prep.file_id
             )));
         } else if let Some(reason) = resume_reason {
             let _ = evt_tx.send(NetEvent::Log(format!(
-                "resume indisponivel para {name} (file_id={file_id}): {reason}; enviando do inicio"
+                "resume indisponivel para {} (file_id={}): {reason}; enviando do inicio",
+                prep.name, prep.file_id
             )));
         }
 
-        if offset > 0 {
-            // Posiciona o arquivo para reenviar somente a parte faltante.
-            file.seek(std::io::SeekFrom::Start(offset)).await?;
+        send_configs.push(FileSendConfig {
+            file_id: prep.file_id,
+            name: prep.name,
+            path: prep.path,
+            size: prep.size,
+            file: prep.file,
+            offset,
+        });
+    }
+
+    // Fase 3: spawnar envio paralelo com semáforo (máx MAX_CONCURRENT_STREAMS streams).
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mut join_set = tokio::task::JoinSet::<bool>::new();
+
+    // Snapshot dos paths para limpeza do journal em caso de cancelamento.
+    let path_size_list: Vec<(PathBuf, u64)> = send_configs
+        .iter()
+        .map(|c| (c.path.clone(), c.size))
+        .collect();
+
+    for mut cfg in send_configs {
+        // Posiciona arquivo no offset antes de mover para a task.
+        if cfg.offset > 0 {
+            cfg.file.seek(std::io::SeekFrom::Start(cfg.offset)).await?;
         }
 
-        // Registra no journal (para retomada pós-crash).
+        // Registra no journal antes de iniciar (para retomada pós-crash).
         {
             let mut j = journal.lock().await;
             j.upsert_progress(
                 &peer_id,
                 TransferDirection::Outgoing,
-                path,
-                size,
-                offset,
+                &cfg.path,
+                cfg.size,
+                cfg.offset,
             );
         }
 
-        let mut stream = match connection.open_uni().await {
-            Ok(stream) => stream,
-            Err(err) => {
-                let _ = evt_tx.send(NetEvent::Log(format!("erro ao abrir stream {err}")));
-                continue;
-            }
-        };
+        let conn = connection.clone();
+        let evt_tx_task = evt_tx.clone();
+        let journal_task = journal.clone();
+        let peer_id_task = peer_id.clone();
+        let sem = semaphore.clone();
+        let cancel = cancel_flag.clone();
+        let chunk_sz = chunk_size;
 
-        let _ = write_wire_message_framed(
-            &mut stream,
-            &WireMessage::FileMeta {
-                file_id,
-                name,
-                size,
-                offset,
-            },
-            evt_tx,
-        )
-        .await;
-        let _ = evt_tx.send(NetEvent::SendStarted {
-            file_id,
-            path: path.clone(),
-            size,
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            send_single_file(
+                &conn,
+                &peer_id_task,
+                cfg.file_id,
+                &cfg.name,
+                cfg.size,
+                cfg.offset,
+                cfg.file,
+                &cfg.path,
+                &evt_tx_task,
+                chunk_sz,
+                journal_task,
+            )
+            .await
         });
+    }
 
-        let mut buffer = vec![0u8; chunk_size.max(TRANSFER_BUFFER_SIZE)];
-        let mut sent_bytes = offset;
-        let mut reported = offset;
-        let mut last_emit = std::time::Instant::now();
-        let mut success = true;
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-
-            if let Err(err) = stream.write_all(&buffer[..read]).await {
-                let _ = evt_tx.send(NetEvent::Log(format!("erro ao enviar {err}")));
-                success = false;
-                break;
-            }
-            sent_bytes += read as u64;
-
-            // Atualiza journal de forma throttled (o próprio journal controla flush).
-            {
-                let mut j = journal.lock().await;
-                j.upsert_progress(
-                    &peer_id,
-                    TransferDirection::Outgoing,
-                    path,
-                    size,
-                    sent_bytes,
-                );
-            }
-
-            if should_emit_progress(sent_bytes, reported, last_emit) {
-                reported = sent_bytes;
-                last_emit = std::time::Instant::now();
-                let _ = evt_tx.send(NetEvent::SendProgress {
-                    file_id,
-                    bytes_sent: sent_bytes,
-                    size,
-                });
-            }
-
-            match handle_send_control(cmd_rx, &mut pending_cmds) {
-                SendOutcome::Canceled => {
-                    let _ = stream.reset(VarInt::from_u32(0));
-                    let _ =
-                        send_message(connection, &WireMessage::Cancel { file_id }, evt_tx).await;
-                    let _ = evt_tx.send(NetEvent::SendCanceled {
-                        file_id,
-                        path: path.clone(),
-                    });
-
-                    {
-                        let mut j = journal.lock().await;
-                        j.remove(&peer_id, TransferDirection::Outgoing, path, size);
-                    }
-
-                    return Ok(SendResult {
-                        outcome: SendOutcome::Canceled,
-                        next_file_id,
-                        pending_cmds,
-                    });
+    // Fase 4: aguardar tasks enquanto monitora cmd_rx para cancelamentos.
+    loop {
+        tokio::select! {
+            result = join_set.join_next() => {
+                if result.is_none() {
+                    break;
                 }
-                SendOutcome::Shutdown => {
-                    let _ = stream.reset(VarInt::from_u32(0));
-                    let _ =
-                        send_message(connection, &WireMessage::Cancel { file_id }, evt_tx).await;
-
-                    {
-                        let mut j = journal.lock().await;
-                        j.upsert_progress(
-                            &peer_id,
-                            TransferDirection::Outgoing,
-                            path,
-                            size,
-                            sent_bytes,
-                        );
-                        let _ = j.flush();
+                // Ignora resultado individual; erros já foram logados em send_single_file.
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(NetCommand::CancelTransfers) => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
+                        // Remove entradas do journal para todos os arquivos preparados.
+                        {
+                            let mut j = journal.lock().await;
+                            for (path, size) in &path_size_list {
+                                j.remove(&peer_id, TransferDirection::Outgoing, path, *size);
+                            }
+                        }
+                        return Ok(SendResult {
+                            outcome: SendOutcome::Canceled,
+                            next_file_id,
+                            pending_cmds,
+                        });
                     }
-
-                    return Ok(SendResult {
-                        outcome: SendOutcome::Shutdown,
-                        next_file_id,
-                        pending_cmds,
-                    });
+                    Some(NetCommand::Shutdown) => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
+                        {
+                            let mut j = journal.lock().await;
+                            let _ = j.flush();
+                        }
+                        return Ok(SendResult {
+                            outcome: SendOutcome::Shutdown,
+                            next_file_id,
+                            pending_cmds,
+                        });
+                    }
+                    Some(NetCommand::InternalResumeAnswer { .. }) => {}
+                    Some(NetCommand::Rebind(addr)) => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
+                        pending_cmds.push(NetCommand::Rebind(addr));
+                        return Ok(SendResult {
+                            outcome: SendOutcome::Canceled,
+                            next_file_id,
+                            pending_cmds,
+                        });
+                    }
+                    Some(other) => pending_cmds.push(other),
+                    None => break,
                 }
-                SendOutcome::Completed => {}
-            }
-        }
-
-        if success {
-            if sent_bytes > reported {
-                let _ = evt_tx.send(NetEvent::SendProgress {
-                    file_id,
-                    bytes_sent: sent_bytes,
-                    size,
-                });
-            }
-            let _ = stream.finish();
-            let _ = evt_tx.send(NetEvent::FileSent {
-                file_id,
-                path: path.clone(),
-            });
-
-            {
-                let mut j = journal.lock().await;
-                j.remove(&peer_id, TransferDirection::Outgoing, path, size);
             }
         }
     }
@@ -726,6 +758,126 @@ pub(crate) async fn send_files(
         next_file_id,
         pending_cmds,
     })
+}
+
+/// Envia um único arquivo via stream QUIC. Retorna `true` em caso de sucesso.
+async fn send_single_file(
+    connection: &quinn::Connection,
+    peer_id: &str,
+    file_id: u64,
+    name: &str,
+    size: u64,
+    offset: u64,
+    mut file: File,
+    path: &Path,
+    evt_tx: &Sender<NetEvent>,
+    chunk_size: usize,
+    journal: Arc<tokio::sync::Mutex<TransferJournal>>,
+) -> bool {
+    let mut stream = match connection.open_uni().await {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = evt_tx.send(NetEvent::Log(format!("erro ao abrir stream {err}")));
+            return false;
+        }
+    };
+
+    let _ = write_wire_message_framed(
+        &mut stream,
+        &WireMessage::FileMeta {
+            file_id,
+            name: name.to_string(),
+            size,
+            offset,
+        },
+        evt_tx,
+    )
+    .await;
+
+    let _ = evt_tx.send(NetEvent::SendStarted {
+        file_id,
+        path: path.to_path_buf(),
+        size,
+    });
+
+    let buf_size = chunk_size.max(TRANSFER_BUFFER_SIZE);
+    let mut buffer = vec![0u8; buf_size];
+    let mut sent_bytes = offset;
+    let mut reported = offset;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_journal_update = std::time::Instant::now();
+    let mut success = true;
+
+    loop {
+        let read = match file.read(&mut buffer).await {
+            Ok(n) => n,
+            Err(err) => {
+                let _ = evt_tx.send(NetEvent::Log(format!("erro ao ler arquivo {err}")));
+                success = false;
+                break;
+            }
+        };
+
+        if read == 0 {
+            break;
+        }
+
+        if let Err(err) = stream.write_all(&buffer[..read]).await {
+            let _ = evt_tx.send(NetEvent::Log(format!("erro ao enviar {err}")));
+            success = false;
+            break;
+        }
+        sent_bytes += read as u64;
+
+        // Journal atualizado de forma throttled (1x/s) para evitar lock no hot loop.
+        if last_journal_update.elapsed() >= JOURNAL_UPDATE_INTERVAL {
+            let mut j = journal.lock().await;
+            j.upsert_progress(peer_id, TransferDirection::Outgoing, path, size, sent_bytes);
+            last_journal_update = std::time::Instant::now();
+        }
+
+        if should_emit_progress(sent_bytes, reported, last_emit) {
+            reported = sent_bytes;
+            last_emit = std::time::Instant::now();
+            let _ = evt_tx.send(NetEvent::SendProgress {
+                file_id,
+                bytes_sent: sent_bytes,
+                size,
+            });
+        }
+    }
+
+    if success {
+        if sent_bytes > reported {
+            let _ = evt_tx.send(NetEvent::SendProgress {
+                file_id,
+                bytes_sent: sent_bytes,
+                size,
+            });
+        }
+        let _ = stream.finish();
+        let _ = evt_tx.send(NetEvent::FileSent {
+            file_id,
+            path: path.to_path_buf(),
+        });
+        {
+            let mut j = journal.lock().await;
+            j.remove(peer_id, TransferDirection::Outgoing, path, size);
+        }
+    } else {
+        let _ = stream.reset(VarInt::from_u32(0));
+        let _ = send_message(connection, &WireMessage::Cancel { file_id }, evt_tx).await;
+        let _ = evt_tx.send(NetEvent::SendCanceled {
+            file_id,
+            path: path.to_path_buf(),
+        });
+        {
+            let mut j = journal.lock().await;
+            j.remove(peer_id, TransferDirection::Outgoing, path, size);
+        }
+    }
+
+    success
 }
 
 fn should_emit_progress(total: u64, reported: u64, last_emit: std::time::Instant) -> bool {

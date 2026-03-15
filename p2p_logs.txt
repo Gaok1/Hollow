@@ -1120,3 +1120,254 @@ endpoint publico [2804:d45:9a05:f400:5cae:75ab:115f:2ebd]:62868
 [INFO] reconfigurando bind para 0.0.0.0:58018
 [INFO] endpoint publico 152.237.164.251:60764
 [INFO] mouse livre: selecione texto no terminal (pressione 'm' para voltar aos cliques)
+[INFO] transporte QUIC: streams confiaveis com TLS 1.3
+[INFO] dados de arquivo: streams unidirecionais com chunks de 262144 bytes
+[INFO] limite de streams unidirecionais simultaneos: 256
+[INFO] identidade local carregada: d08f854550d5c65e8a842c326770c644 (pubkey b64=vvvBbA5TBNl8JXA25zxrNHSWeyd2QG8s/DzsiMORoys=)
+[INFO] endpoint publico 152.237.164.251:59709
+[INFO] mouse livre: selecione texto no terminal (pressione 'm' para voltar aos cliques)
+[INFO] mouse capturado: cliques habilitados (botões funcionam)
+[INFO] mouse livre: selecione texto no terminal (pressione 'm' para voltar aos cliques)
+[INFO] mouse capturado: cliques habilitados (botões funcionam)
+[INFO] transporte QUIC: streams confiaveis com TLS 1.3
+[INFO] dados de arquivo: streams unidirecionais com chunks de 262144 bytes
+[INFO] limite de streams unidirecionais simultaneos: 256
+[INFO] identidade local carregada: d08f854550d5c65e8a842c326770c644 (pubkey b64=vvvBbA5TBNl8JXA25zxrNHSWeyd2QG8s/DzsiMORoys=)
+[INFO] endpoint publico 152.237.164.251:59679
+[INFO] ip colado
+[INFO] copiado 152.237.164.251:59679
+[INFO] Use IP:porta, ex: 192.168.1.10:3000
+[INFO] Use IP:porta, ex: 192.168.1.10:3000
+[INFO] Use IP:porta, ex: 192.168.1.10:3000
+[INFO] transporte QUIC: streams confiaveis com TLS 1.3
+[INFO] dados de arquivo: streams unidirecionais com chunks de 262144 bytes
+[INFO] limite de streams unidirecionais simultaneos: 256
+[INFO] identidade local carregada: d08f854550d5c65e8a842c326770c644 (pubkey b64=vvvBbA5TBNl8JXA25zxrNHSWeyd2QG8s/DzsiMORoys=)
+[INFO] endpoint publico 152.237.164.251:59867
+[INFO] ip colado
+[INFO] ip colado
+[INFO] copiado 152.237.164.251:59867
+[INFO] transporte QUIC: streams confiaveis com TLS 1.3
+[INFO] dados de arquivo: streams unidirecionais com chunks de 262144 bytes
+[INFO] limite de streams unidirecionais simultaneos: 256
+[INFO] identidade local carregada: d08f854550d5c65e8a842c326770c644 (pubkey b64=vvvBbA5TBNl8JXA25zxrNHSWeyd2QG8s/DzsiMORoys=)
+[INFO] endpoint publico 152.237.164.251:61281
+[INFO] informe o IP/porta do parceiro antes de testar
+[INFO] informe o IP/porta do parceiro antes de testar
+[INFO] Informe o endereço do parceiro antes de conectar
+[INFO] copiado 152.237.164.251:61281
+[INFO] ip colado
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] teste rapido iniciado para 152.237.164.251:61281
+[INFO] teste ok 152.237.164.251:61281: respondeu em 14 ms (teste UDP/TLS)
+[INFO] conexao encerrada closed by peer: probe (code 0)
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: probe (code 0)
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] copiado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] ip colado
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] teste rapido iniciado para 152.237.164.251:61281
+[INFO] teste ok 152.237.164.251:61281: respondeu em 10 ms (teste UDP/TLS)
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: probe (code 0)
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: probe (code 0)
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281
+[INFO] conectando 152.237.164.251:61281
+[INFO] conectado 152.237.164.251:61281
+[INFO] conexao encerrada closed by peer: 0
+[INFO] conexao perdida 152.237.164.251:61281: closed by peer: 0
+[INFO] desconectado 152.237.164.251:61281

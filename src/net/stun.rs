@@ -130,24 +130,45 @@ fn detect_public_endpoint_on_socket_inner(
         format!("stun trace: servers={}", servers.join(", ")),
     );
 
-    let mut seed = txid_seed();
-    let mut last_err = None;
+    // Resolve all DNS in parallel to avoid serial blocking (each can take 200-500ms).
+    let total_servers = servers.len();
+    let (resolve_tx, resolve_rx) = mpsc::channel::<(String, io::Result<Vec<SocketAddr>>)>();
+    for server in servers {
+        let tx = resolve_tx.clone();
+        let bind = bind_addr;
+        thread::spawn(move || {
+            let result = resolve_stun_server_addrs(&server, bind);
+            let _ = tx.send((server, result));
+        });
+    }
+    drop(resolve_tx);
+
+    // Collect all results with a deadline (1.5s total for DNS phase).
+    const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_millis(1500);
+    let dns_deadline = Instant::now() + DNS_RESOLVE_TIMEOUT;
+    let mut resolved_servers: Vec<(String, Vec<SocketAddr>)> = Vec::new();
     let mut resolve_failures = 0usize;
     let mut dns_failures = 0usize;
     let mut family_mismatch_failures = 0usize;
+    let mut last_err = None;
 
-    #[derive(Clone)]
-    struct SentRequest {
-        server: String,
-        addr: SocketAddr,
-        txid: [u8; 12],
-    }
-    let mut sent_requests: Vec<SentRequest> = Vec::new();
-    let total_servers = servers.len();
-    for server in servers {
-        let server_addrs = match resolve_stun_server_addrs(server.as_str(), bind_addr) {
-            Ok(addrs) => addrs,
-            Err(err) => {
+    for _ in 0..total_servers {
+        let remaining = dns_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match resolve_rx.recv_timeout(remaining) {
+            Ok((server, Ok(addrs))) => {
+                stun_trace(
+                    &mut trace,
+                    format!(
+                        "stun trace: resolve {server} -> {}",
+                        fmt_addrs(&addrs)
+                    ),
+                );
+                resolved_servers.push((server, addrs));
+            }
+            Ok((server, Err(err))) => {
                 resolve_failures += 1;
                 if is_dns_resolution_error(&err) {
                     dns_failures += 1;
@@ -160,17 +181,21 @@ fn detect_public_endpoint_on_socket_inner(
                     &mut trace,
                     format!("stun trace: resolve {server} -> ERROR {err}"),
                 );
-                continue;
             }
-        };
-        stun_trace(
-            &mut trace,
-            format!(
-                "stun trace: resolve {server} -> {}",
-                fmt_addrs(&server_addrs)
-            ),
-        );
+            Err(_) => break, // timeout
+        }
+    }
 
+    let mut seed = txid_seed();
+
+    #[derive(Clone)]
+    struct SentRequest {
+        server: String,
+        addr: SocketAddr,
+        txid: [u8; 12],
+    }
+    let mut sent_requests: Vec<SentRequest> = Vec::new();
+    for (server, server_addrs) in resolved_servers {
         let mut sent = false;
         for server_addr in server_addrs {
             let txid = next_transaction_id(&mut seed);
@@ -211,6 +236,7 @@ fn detect_public_endpoint_on_socket_inner(
             }
         }
         if !sent {
+            resolve_failures += 1;
             continue;
         }
     }

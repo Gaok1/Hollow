@@ -29,11 +29,11 @@ use super::transfer::{
 
 use ring::rand::{SecureRandom, SystemRandom};
 
-pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 const MIN_CHUNK_SIZE: usize = 16 * 1024;
-const MAX_CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_CONCURRENT_UNI_STREAMS: u32 = 256;
-pub(crate) const PROTOCOL_VERSION: u8 = 3;
+pub(crate) const PROTOCOL_VERSION: u8 = 4;
 pub(crate) const OBSERVED_ENDPOINT_VERSION: u8 = 2;
 pub(crate) const HEARTBEAT_VERSION: u8 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
@@ -1428,7 +1428,7 @@ fn make_endpoint(
 
 fn make_transport_config(target_window: u64, autotune: &AutotuneConfig) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_UNI_STREAMS));
     if let Ok(timeout) = quinn::IdleTimeout::try_from(Duration::from_secs(60)) {
         transport.max_idle_timeout(Some(timeout));
@@ -1529,7 +1529,8 @@ fn configure_flow_control(
     target_window: u64,
     autotune: &AutotuneConfig,
 ) {
-    let clamped = autotune.clamp_target(target_window);
+    let effective_target = target_window.max(4 * 1024 * 1024);
+    let clamped = autotune.clamp_target(effective_target);
     let flow_window = clamped.min(quinn::VarInt::MAX.into_inner());
     let flow_window = quinn::VarInt::from_u64(flow_window)
         .expect("flow control window within QUIC varint bounds");
@@ -1907,8 +1908,9 @@ mod tests {
             }),
             0
         );
-        assert_eq!(tag(&WireMessage::Punch { nonce: 0 }), 1);
-        assert_eq!(tag(&WireMessage::Cancel { file_id: 0 }), 2);
+        // IdentityInit = 1, IdentityAck = 2 (not tested here, stable by position)
+        assert_eq!(tag(&WireMessage::Punch { nonce: 0 }), 3);
+        assert_eq!(tag(&WireMessage::Cancel { file_id: 0 }), 4);
         assert_eq!(
             tag(&WireMessage::FileMeta {
                 file_id: 0,
@@ -1916,7 +1918,7 @@ mod tests {
                 size: 0,
                 offset: 0,
             }),
-            3
+            5
         );
         assert_eq!(
             tag(&WireMessage::ResumeQuery {
@@ -1924,7 +1926,7 @@ mod tests {
                 name: "file.bin".to_string(),
                 size: 0,
             }),
-            4
+            6
         );
         assert_eq!(
             tag(&WireMessage::ResumeAnswer {
@@ -1933,16 +1935,9 @@ mod tests {
                 ok: true,
                 reason: None,
             }),
-            5
+            7
         );
-        assert_eq!(
-            tag(&WireMessage::FileChunk {
-                file_id: 0,
-                data: Vec::new(),
-            }),
-            6
-        );
-        assert_eq!(tag(&WireMessage::FileDone { file_id: 0 }), 7);
+        // FileChunk (was 8) and FileDone (was 9) removed in protocol v4
         assert_eq!(
             tag(&WireMessage::ObservedEndpoint {
                 addr: "127.0.0.1:1".parse().expect("addr"),

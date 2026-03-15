@@ -13,7 +13,7 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 use super::{append_log_to_file, detect_local_ips, format_log_line, infer_log_level};
-use super::components::{Button, ReceivedClickTarget, ClickTarget};
+use super::components::{Button, ReceivedClickTarget, RecentClickTarget};
 
 pub const MAX_PEER_INPUT: usize = 120;
 pub const MAX_LOGS: usize = 200;
@@ -348,7 +348,6 @@ pub struct AppState {
     pub stun_status: Option<String>,
 
     pub mouse_capture_enabled: bool,
-    pub mouse_capture_request: Option<bool>,
 
     // áreas
     pub received_click_targets: Vec<ReceivedClickTarget>,
@@ -384,6 +383,14 @@ pub struct AppState {
 
     pub needs_clear: bool,
     pub should_quit: bool,
+
+    // toast de arquivo recebido
+    pub last_received_toast: Option<(String, std::time::Instant)>,
+
+    // conexões recentes
+    pub recent_profiles: Vec<crate::profiles::ConnectionProfile>,
+    pub show_recents: bool,
+    pub recent_click_targets: Vec<RecentClickTarget>,
 }
 
 impl AppState {
@@ -415,7 +422,6 @@ impl AppState {
             stun_status: None,
 
             mouse_capture_enabled: true,
-            mouse_capture_request: None,
 
             received_click_targets: Vec::new(),
             tab_click_targets: Vec::new(),
@@ -449,6 +455,12 @@ impl AppState {
 
             needs_clear: false,
             should_quit: false,
+
+            last_received_toast: None,
+
+            recent_profiles: Vec::new(),
+            show_recents: false,
+            recent_click_targets: Vec::new(),
         };
 
         app.refresh_history();
@@ -758,6 +770,41 @@ impl AppState {
             (IpMode::Ipv6, SocketAddr::V6(_)) => Some(endpoint),
             _ => None,
         })
+    }
+
+    pub fn load_recent_profiles(&mut self) {
+        match crate::profiles::ProfileStore::load() {
+            Ok(store) => {
+                let mut profiles: Vec<_> = store.profiles().to_vec();
+                profiles.reverse();
+                profiles.truncate(5);
+                self.recent_profiles = profiles;
+            }
+            Err(_) => {
+                self.recent_profiles = Vec::new();
+            }
+        }
+    }
+
+    pub fn save_current_as_recent(&mut self, addr: SocketAddr) {
+        let profile = crate::profiles::ConnectionProfile {
+            name: addr.to_string(),
+            peer: addr,
+            alias: None,
+            key: None,
+        };
+        match crate::profiles::ProfileStore::load() {
+            Ok(mut store) => {
+                store.upsert(profile);
+                if let Err(err) = store.save() {
+                    self.push_log(format!("erro ao salvar perfil recente: {err}"));
+                }
+            }
+            Err(err) => {
+                self.push_log(format!("erro ao carregar perfis: {err}"));
+            }
+        }
+        self.load_recent_profiles();
     }
 }
 

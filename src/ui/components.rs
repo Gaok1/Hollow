@@ -24,16 +24,13 @@ pub struct ReceivedClickTarget {
 pub enum ButtonAction {
     ConnectPeer,
     ProbePeer,
-    SelectIpv4,
-    SelectIpv6,
-    ToggleMouseMode,
-    CopyLocalIp,
-    CopyPublicEndpoint,
+    CopyBestAddress,
     PastePeerIp,
     AddFiles,
     SendFiles,
     CancelTransfers,
     Quit,
+    ToggleRecents,
 }
 
 #[derive(Clone)]
@@ -41,6 +38,12 @@ pub struct Button {
     pub label: String,
     pub area: Rect,
     pub action: ButtonAction,
+}
+
+#[derive(Clone)]
+pub struct RecentClickTarget {
+    pub area: Rect,
+    pub addr: String,
 }
 
 pub trait ClickTarget {
@@ -95,6 +98,23 @@ impl ClickTarget for ReceivedClickTarget {
                     app.push_log(format!("erro ao abrir pasta {}: {err}", path.display()))
                 }
             },
+        }
+    }
+}
+
+impl ClickTarget for RecentClickTarget {
+    fn area(&self) -> Rect {
+        self.area
+    }
+
+    fn on_click(&self, app: &mut AppState, _net_tx: &UnboundedSender<NetCommand>) {
+        app.peer_input = self.addr.clone();
+        app.peer_label = None;
+        app.peer_focus = true;
+        app.show_recents = false;
+        // Auto-infer mode from the address
+        if let Some(addr) = super::parse_peer_addr_pub(&self.addr) {
+            super::apply_inferred_mode(app, addr);
         }
     }
 }

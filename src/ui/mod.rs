@@ -5,7 +5,7 @@
 use std::{
     fs::OpenOptions,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::mpsc::Receiver,
     time::{Duration, Instant},
@@ -35,7 +35,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::net::{NetCommand, NetEvent};
 
 mod components;
-use components::{Button, ButtonAction, ClickTarget, ReceivedClickAction, ReceivedClickTarget};
+use components::{Button, ButtonAction, ClickTarget, ReceivedClickAction, ReceivedClickTarget, RecentClickTarget};
 
 mod state;
 pub use state::*;
@@ -144,9 +144,6 @@ pub fn run_app(
                                     app.cycle_log_filter();
                                 }
                             }
-                            KeyCode::Char('m') => {
-                                app.mouse_capture_request = Some(!app.mouse_capture_enabled);
-                            }
                             KeyCode::Char('r')
                                 if matches!(app.active_tab, ActiveTab::Downloads) =>
                             {
@@ -166,18 +163,6 @@ pub fn run_app(
             }
         }
 
-        if let Some(enabled) = app.mouse_capture_request.take() {
-            set_mouse_capture(terminal, enabled)?;
-            app.mouse_capture_enabled = enabled;
-
-            if enabled {
-                app.push_log("mouse capturado: cliques habilitados (botões funcionam)");
-            } else {
-                // Aqui não tem como fugir: para voltar a clicar, precisa reativar.
-                app.push_log("mouse livre: selecione texto no terminal (pressione 'm' para voltar aos cliques)" );
-            }
-        }
-
         if app.should_quit {
             break;
         }
@@ -186,17 +171,6 @@ pub fn run_app(
     Ok(())
 }
 
-fn set_mouse_capture(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    enabled: bool,
-) -> io::Result<()> {
-    if enabled {
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
-    } else {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    Ok(())
-}
 
 // -------------------------------
 // Net events
@@ -208,12 +182,20 @@ fn handle_net_event(app: &mut AppState, event: NetEvent) {
             let lower = message.to_ascii_lowercase();
             if lower.starts_with("stun indisponivel") {
                 app.stun_status = Some("stun indisponivel".to_string());
+                app.push_log(message);
+                app.push_log_with_level(
+                    LogLevel::Warn,
+                    "Não foi possível detectar seu IP público. Em rede local, use seu IP local normalmente.",
+                );
             } else if lower.starts_with("stun erro") {
                 app.stun_status = Some("stun falhou".to_string());
+                app.push_log(message);
             } else if lower.starts_with("endpoint publico") {
                 app.stun_status = None;
+                app.push_log(message);
+            } else {
+                app.push_log(message);
             }
-            app.push_log(message);
         }
         NetEvent::Bound(addr) => {
             app.bind_addr = addr;
@@ -266,6 +248,11 @@ fn handle_net_event(app: &mut AppState, event: NetEvent) {
                 entry.rate_mbps = 0.0;
                 entry.rate_started_at = None;
             }
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            app.last_received_toast = Some((filename, std::time::Instant::now()));
             app.push_log(format!("recebido {}", path.display()));
             app.push_history_entry(path, Some(from.to_string()));
         }
@@ -397,6 +384,7 @@ fn handle_net_event(app: &mut AppState, event: NetEvent) {
             app.peer_addr = Some(addr);
             app.connect_status = ConnectStatus::Connected(addr);
             app.push_log(format!("conectado {addr}"));
+            app.save_current_as_recent(addr);
         }
         NetEvent::PeerDisconnected(addr) => {
             if app.peer_addr == Some(addr) {
@@ -410,7 +398,7 @@ fn handle_net_event(app: &mut AppState, event: NetEvent) {
                 app.peer_addr = None;
             }
             app.connect_status = ConnectStatus::Timeout(addr);
-            app.push_log(format!("tempo esgotado {addr}"));
+            app.push_log("Parceiro não respondeu. Verifique se o endereço está certo e se o app está aberto no outro lado.");
         }
         NetEvent::ReceiveFailed { file_id, path } => {
             if let Some(entry) = app
@@ -484,13 +472,23 @@ fn handle_mouse_event(
             // Clique fora: tira foco do input
             app.peer_focus = false;
 
+            // 0) Recentes dropdown (overlay)
+            if app.show_recents {
+                let recent_targets = app.recent_click_targets.clone();
+                if handle_click_targets(&recent_targets, position, app, net_tx) {
+                    return;
+                }
+                // Click outside closes the dropdown
+                app.show_recents = false;
+            }
+
             // 1) Tabs clicáveis
             let tab_targets = app.tab_click_targets.clone();
             if handle_click_targets(&tab_targets, position, app, net_tx) {
                 return;
             }
 
-            // 2) Ações “UI” (scroll top/bottom, abrir busca, etc.)
+            // 2) Ações "UI" (scroll top/bottom, abrir busca, etc.)
             let ui_targets = app.ui_click_targets.clone();
             if handle_click_targets(&ui_targets, position, app, net_tx) {
                 return;
@@ -502,7 +500,7 @@ fn handle_mouse_event(
                 return;
             }
 
-            // 4) Botões “normais”
+            // 4) Botões "normais"
             let buttons = app.buttons.clone();
             handle_click_targets(&buttons, position, app, net_tx);
         }
@@ -539,14 +537,14 @@ fn handle_button_action(
             }
             start_probe(app, net_tx)
         }
-        ButtonAction::SelectIpv4 => handle_mode_change(app, IpMode::Ipv4, net_tx),
-        ButtonAction::SelectIpv6 => handle_mode_change(app, IpMode::Ipv6, net_tx),
-        ButtonAction::ToggleMouseMode => {
-            app.mouse_capture_request = Some(!app.mouse_capture_enabled);
-        }
-        ButtonAction::CopyLocalIp => copy_local_ip(app),
-        ButtonAction::CopyPublicEndpoint => copy_public_endpoint(app),
+        ButtonAction::CopyBestAddress => copy_best_address(app),
         ButtonAction::PastePeerIp => paste_peer_ip(app),
+        ButtonAction::ToggleRecents => {
+            app.show_recents = !app.show_recents;
+            if app.show_recents {
+                app.load_recent_profiles();
+            }
+        }
         ButtonAction::AddFiles => {
             if let Some(files) = pick_files_dialog(app.mouse_capture_enabled) {
                 for path in files {
@@ -593,47 +591,8 @@ fn handle_button_action(
 }
 
 // -------------------------------
-// Mode / peer input
+// Peer input
 // -------------------------------
-
-fn handle_mode_change(
-    app: &mut AppState,
-    mode: IpMode,
-    net_tx: &tokio_mpsc::UnboundedSender<NetCommand>,
-) {
-    if app.mode == mode {
-        return;
-    }
-
-    app.select_mode(mode);
-    app.connect_status = ConnectStatus::Idle;
-    app.peer_addr = None;
-    app.public_endpoint = None;
-    app.stun_status = None;
-
-    let new_bind = bind_for_mode(app.bind_addr, mode);
-    if new_bind != app.bind_addr {
-        app.bind_addr = new_bind;
-        app.local_ip = detect_local_ips(new_bind.ip());
-        if let Err(err) = net_tx.send(NetCommand::Rebind(new_bind)) {
-            app.push_log(format!("erro ao trocar modo {err}"));
-        }
-    }
-}
-
-fn bind_for_mode(current: SocketAddr, mode: IpMode) -> SocketAddr {
-    let port = current.port();
-    match mode {
-        IpMode::Ipv4 => match current.ip() {
-            IpAddr::V4(addr) => SocketAddr::new(IpAddr::V4(addr), port),
-            IpAddr::V6(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-        },
-        IpMode::Ipv6 => match current.ip() {
-            IpAddr::V6(addr) => SocketAddr::new(IpAddr::V6(addr), port),
-            IpAddr::V4(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
-        },
-    }
-}
 
 fn handle_peer_input_key(
     app: &mut AppState,
@@ -719,8 +678,10 @@ fn handle_history_search_key(app: &mut AppState, key: KeyCode) {
 }
 
 fn start_probe(app: &mut AppState, net_tx: &tokio_mpsc::UnboundedSender<NetCommand>) {
-    match parse_peer_addr(&app.peer_input) {
+    let input = app.peer_input.clone();
+    match parse_peer_addr(&input) {
         Some(addr) => {
+            apply_inferred_mode(app, addr);
             app.probe_status = Some(ProbeStatus {
                 peer: addr,
                 message: "testando conectividade...".to_string(),
@@ -732,13 +693,15 @@ fn start_probe(app: &mut AppState, net_tx: &tokio_mpsc::UnboundedSender<NetComma
                 app.push_log(format!("teste rapido iniciado para {addr}"));
             }
         }
-        None => app.push_log("endereco do parceiro invalido"),
+        None => app.push_log(peer_addr_error_hint(&input)),
     }
 }
 
 fn start_connect(app: &mut AppState, net_tx: &tokio_mpsc::UnboundedSender<NetCommand>) {
-    match parse_peer_addr(&app.peer_input) {
+    let input = app.peer_input.clone();
+    match parse_peer_addr(&input) {
         Some(addr) => {
+            apply_inferred_mode(app, addr);
             if let Err(err) = net_tx.send(NetCommand::ConnectPeer(addr)) {
                 app.push_log(format!("erro ao enviar conexao {err}"));
             } else {
@@ -746,7 +709,7 @@ fn start_connect(app: &mut AppState, net_tx: &tokio_mpsc::UnboundedSender<NetCom
                 app.peer_addr = None;
             }
         }
-        None => app.push_log("endereco do parceiro invalido"),
+        None => app.push_log(peer_addr_error_hint(&input)),
     }
 }
 
@@ -756,51 +719,103 @@ fn parse_peer_addr(input: &str) -> Option<SocketAddr> {
         return None;
     }
 
-    trimmed.parse().ok()
+    // Try standard parse first
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+
+    // Try "IP porta" (space-separated)
+    let parts: Vec<&str> = trimmed.rsplitn(2, ' ').collect();
+    if parts.len() == 2 {
+        let port_str = parts[0].trim();
+        let ip_str = parts[1].trim();
+        if let Ok(port) = port_str.parse::<u16>() {
+            // Try auto-bracket IPv6 if needed
+            let candidate = if ip_str.contains(':') && !ip_str.starts_with('[') {
+                format!("[{ip_str}]:{port}")
+            } else {
+                format!("{ip_str}:{port}")
+            };
+            if let Ok(addr) = candidate.parse::<SocketAddr>() {
+                return Some(addr);
+            }
+        }
+    }
+
+    // Try auto-fix bare IPv6 without brackets: "2001:db8::1:3000" won't work,
+    // but handle the case where user typed IPv6 colon-separated and port at end
+    // e.g. "2001:db8::1" — no port, skip
+    None
+}
+
+/// Public wrapper for use in components.rs
+pub fn parse_peer_addr_pub(input: &str) -> Option<SocketAddr> {
+    parse_peer_addr(input)
+}
+
+fn infer_mode_from_addr(addr: &SocketAddr) -> IpMode {
+    match addr {
+        SocketAddr::V4(_) => IpMode::Ipv4,
+        SocketAddr::V6(_) => IpMode::Ipv6,
+    }
+}
+
+pub fn apply_inferred_mode(app: &mut AppState, addr: SocketAddr) {
+    let mode = infer_mode_from_addr(&addr);
+    if app.mode != mode {
+        app.mode = mode;
+        app.needs_clear = true;
+    }
+}
+
+fn peer_addr_error_hint(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "Informe o endereço do parceiro antes de conectar".to_string();
+    }
+    if trimmed.contains(':') && !trimmed.contains('.') {
+        // looks like IPv6 without port
+        return "Para IPv6 use: [2001:db8::1]:3000".to_string();
+    }
+    "Use IP:porta, ex: 192.168.1.10:3000".to_string()
+}
+
+fn best_sharable_address(app: &AppState) -> Option<String> {
+    if let Some(endpoint) = app.public_endpoint {
+        let text = match endpoint {
+            SocketAddr::V4(_) => endpoint.to_string(),
+            SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+        };
+        return Some(text);
+    }
+    None
+}
+
+fn copy_best_address(app: &mut AppState) {
+    let text = if let Some(addr_str) = best_sharable_address(app) {
+        addr_str
+    } else if let Some(local_ip) = app.current_local_ip() {
+        match local_ip {
+            IpAddr::V4(v4) => format!("{}:{}", v4, app.bind_addr.port()),
+            IpAddr::V6(v6) => format!("[{}]:{}", v6, app.bind_addr.port()),
+        }
+    } else {
+        app.push_log("endereço não encontrado para copiar");
+        return;
+    };
+
+    match Clipboard::new() {
+        Ok(mut clipboard) => match clipboard.set_text(text.clone()) {
+            Ok(()) => app.push_log(format!("copiado {text}")),
+            Err(err) => app.push_log(format!("erro no clipboard {err}")),
+        },
+        Err(err) => app.push_log(format!("erro no clipboard {err}")),
+    }
 }
 
 // -------------------------------
 // Clipboard
 // -------------------------------
-
-fn copy_local_ip(app: &mut AppState) {
-    let addr = match app.current_local_ip() {
-        Some(addr) => addr,
-        None => {
-            app.push_log("ip local nao encontrado");
-            return;
-        }
-    };
-    let text = match addr {
-        IpAddr::V4(v4) => format!("{}:{}", v4, app.bind_addr.port()),
-        IpAddr::V6(v6) => format!("[{}]:{}", v6, app.bind_addr.port()),
-    };
-    match Clipboard::new() {
-        Ok(mut clipboard) => match clipboard.set_text(text.clone()) {
-            Ok(()) => app.push_log(format!("copiado {text}")),
-            Err(err) => app.push_log(format!("erro no clipboard {err}")),
-        },
-        Err(err) => app.push_log(format!("erro no clipboard {err}")),
-    }
-}
-
-fn copy_public_endpoint(app: &mut AppState) {
-    let endpoint = match app.current_public_endpoint() {
-        Some(endpoint) => endpoint,
-        None => {
-            app.push_log("endpoint publico nao encontrado");
-            return;
-        }
-    };
-    let text = endpoint.to_string();
-    match Clipboard::new() {
-        Ok(mut clipboard) => match clipboard.set_text(text.clone()) {
-            Ok(()) => app.push_log(format!("copiado {text}")),
-            Err(err) => app.push_log(format!("erro no clipboard {err}")),
-        },
-        Err(err) => app.push_log(format!("erro no clipboard {err}")),
-    }
-}
 
 fn paste_peer_ip(app: &mut AppState) {
     let mut clipboard = match Clipboard::new() {
@@ -821,9 +836,13 @@ fn paste_peer_ip(app: &mut AppState) {
             if filtered.is_empty() {
                 app.push_log("clipboard vazio");
             } else {
-                app.peer_input = filtered;
+                app.peer_input = filtered.clone();
                 app.peer_label = None;
                 app.peer_focus = true;
+                // Auto-infer mode from pasted address if valid
+                if let Some(addr) = parse_peer_addr(&filtered) {
+                    apply_inferred_mode(app, addr);
+                }
                 app.push_log("ip colado");
             }
         }
@@ -929,31 +948,6 @@ fn button_style(theme: Theme, accent: Color, hover: bool, enabled: bool) -> Styl
             .fg(accent)
             .bg(theme.panel)
             .add_modifier(Modifier::BOLD)
-    }
-}
-
-fn mode_button_style(theme: Theme, active: bool, hover: bool, enabled: bool) -> Style {
-    if active {
-        return if enabled {
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.ok)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.warn)
-                .add_modifier(Modifier::BOLD)
-        };
-    }
-
-    if enabled {
-        button_style(theme, theme.info, hover, enabled)
-    } else {
-        Style::default()
-            .fg(theme.muted)
-            .bg(theme.panel)
-            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -1430,19 +1424,15 @@ fn draw_ui(frame: &mut Frame, app: &mut AppState) {
 
     frame.render_widget(root_bg(theme), frame.size());
 
-    let footer_h = if matches!(app.active_tab, ActiveTab::Transfers) {
-        3
-    } else {
-        0
-    };
+    let footer_h = if matches!(app.active_tab, ActiveTab::Transfers) { 1 } else { 0 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(15), // header (conexão)
-            Constraint::Length(3),  // tabs (clicáveis)
-            Constraint::Min(10),    // conteúdo
-            Constraint::Length(footer_h), // ações (só Transferências)
+            Constraint::Length(6),        // header (connection panel)
+            Constraint::Length(1),        // tab bar
+            Constraint::Min(10),          // content
+            Constraint::Length(footer_h), // footer (transfers only)
         ])
         .split(frame.size());
 
@@ -1475,56 +1465,46 @@ fn draw_ui(frame: &mut Frame, app: &mut AppState) {
 // -------------------------------
 
 fn render_tab_bar(frame: &mut Frame, area: Rect, app: &mut AppState, theme: Theme) {
-    let tabs = [
-        ("Transferências", ActiveTab::Transfers),
-        ("Downloads", ActiveTab::Downloads),
-        ("Eventos", ActiveTab::Events),
+    let tabs_data = [
+        ("  Transferências  ", ActiveTab::Transfers),
+        ("  Downloads  ", ActiveTab::Downloads),
+        ("  Eventos  ", ActiveTab::Events),
     ];
+
+    // Fill background first
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        area,
+    );
+
+    let widths: Vec<Constraint> = tabs_data
+        .iter()
+        .map(|(label, _)| Constraint::Length(label.chars().count() as u16))
+        .chain(std::iter::once(Constraint::Min(0)))
+        .collect();
 
     let sections = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints(widths)
         .split(area);
 
     let mut targets = Vec::new();
-
-    for ((label, tab), chunk) in tabs.into_iter().zip(sections.iter()) {
-        let active = app.active_tab == tab;
-        let (text_style, border_color) = if active {
-            (
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-                theme.accent,
-            )
+    for (i, (label, tab)) in tabs_data.iter().enumerate() {
+        let active = app.active_tab == *tab;
+        let style = if active {
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
-            (
-                Style::default()
-                    .fg(theme.muted)
-                    .bg(Color::Rgb(22, 26, 33)),
-                theme.border,
-            )
+            Style::default().fg(theme.muted).bg(theme.bg)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(if active { theme.accent } else { Color::Rgb(22, 26, 33) }));
-
-        let tab_widget = Paragraph::new(label)
-            .alignment(Alignment::Center)
-            .style(text_style)
-            .block(block);
-
-        frame.render_widget(tab_widget, *chunk);
-        targets.push(TabClickTarget { area: *chunk, tab });
+        frame.render_widget(
+            Paragraph::new(*label).style(style),
+            sections[i],
+        );
+        targets.push(TabClickTarget { area: sections[i], tab: *tab });
     }
-
     app.tab_click_targets = targets;
 }
 
@@ -1556,13 +1536,55 @@ fn render_transfer_tab(
         .collect::<Vec<_>>();
 
     let selected = List::new(selected_items)
-        .block(block_with_title(theme, "Saida"))
+        .block(block_with_title(theme, "Enviar"))
         .style(Style::default().bg(theme.panel));
 
     frame.render_widget(selected, body[0]);
 
-    // Recebendo
-    let list_area = body[1];
+    // Recebendo — verifica toast
+    let toast_active = app
+        .last_received_toast
+        .as_ref()
+        .is_some_and(|(_, t)| t.elapsed() < Duration::from_secs(8));
+
+    let received_panel_area = body[1];
+
+    let (toast_area, list_area) = if toast_active {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(received_panel_area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, received_panel_area)
+    };
+
+    // Toast
+    if let (Some(toast_rect), Some((filename, _))) = (toast_area, &app.last_received_toast) {
+        let toast_row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(10)])
+            .split(toast_rect);
+
+        let toast_line = Line::from(vec![
+            Span::styled("Salvo em: ./received/", Style::default().fg(theme.muted)),
+            Span::styled(filename.clone(), Style::default().fg(theme.ok).add_modifier(Modifier::BOLD)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(toast_line)
+                .block(subtle_block(theme))
+                .style(Style::default().bg(theme.panel)),
+            toast_row[0],
+        );
+        frame.render_widget(
+            Paragraph::new(" Abrir ")
+                .alignment(Alignment::Center)
+                .style(button_style(theme, theme.ok, false, true))
+                .block(subtle_block(theme)),
+            toast_row[1],
+        );
+    }
+
     let max_entries = max_received_entries_for_area(list_area).min(24);
     let received_view = build_received_view(&app.received, max_entries);
     let mut received_items = Vec::new();
@@ -1579,7 +1601,7 @@ fn render_transfer_tab(
     }
 
     let received = List::new(received_items)
-        .block(block_with_title(theme, "Entrada"))
+        .block(block_with_title(theme, "Recebidos"))
         .style(Style::default().bg(theme.panel));
 
     app.received_click_targets = build_received_click_targets(list_area, &received_view);
@@ -1736,7 +1758,7 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: T
     // Barra de controle com botões clicáveis
     let log_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(layout[1]);
 
     let hover = app.last_mouse;
@@ -1777,8 +1799,7 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme: T
 
     frame.render_widget(
         Paragraph::new(filter_line)
-            .block(subtle_block(theme))
-            .style(Style::default().bg(theme.panel)),
+            .style(Style::default().bg(theme.bg)),
         ctrl[0],
     );
 
@@ -1825,8 +1846,8 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(6),
         ])
         .split(area);
@@ -1870,8 +1891,7 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
 
     frame.render_widget(
         Paragraph::new(search_line)
-            .block(block_with_title(theme, "histórico de downloads"))
-            .style(Style::default().bg(theme.panel)),
+            .style(Style::default().bg(theme.bg)),
         top[0],
     );
 
@@ -1898,8 +1918,7 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
         .unwrap_or_else(|| format!("{} itens registrados", app.history_entries.len()));
 
     let status = Paragraph::new(status_text)
-        .block(subtle_block(theme))
-        .style(Style::default().fg(theme.muted).bg(theme.panel));
+        .style(Style::default().fg(theme.muted).bg(theme.bg));
 
     frame.render_widget(status, layout[1]);
 
@@ -2008,6 +2027,39 @@ fn render_downloads_tab(frame: &mut Frame, area: Rect, app: &mut AppState, theme
 }
 
 // -------------------------------
+// Flat button helper
+// -------------------------------
+
+fn render_flat_button(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    accent: Color,
+    hover: bool,
+    enabled: bool,
+    theme: Theme,
+) {
+    let style = if !enabled {
+        Style::default().fg(theme.muted).bg(theme.bg)
+    } else if hover {
+        Style::default()
+            .fg(theme.bg)
+            .bg(accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // Subtle panel background makes buttons visually distinct from plain text
+        Style::default()
+            .fg(accent)
+            .bg(theme.panel)
+            .add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(
+        Paragraph::new(label).alignment(Alignment::Center).style(style),
+        area,
+    );
+}
+
+// -------------------------------
 // Connection panel (botões SEM sumir)
 // -------------------------------
 
@@ -2021,131 +2073,95 @@ fn render_connection_panel(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // modo + mouse
-            Constraint::Length(3), // input + botões
-            Constraint::Length(3), // local
-            Constraint::Length(3), // publico
-            Constraint::Length(3), // status curto
-            Constraint::Length(0), // assistente (removido)
+            Constraint::Length(1), // Row 0: branding + status
+            Constraint::Length(3), // Row 1: IP input field + [Colar IP] button
+            Constraint::Length(1), // Row 2: [▾ Recentes]  |  [⚡ Testar] [→ Conectar]
+            Constraint::Length(1), // Row 3: "Para compartilhar: addr"  +  [Copiar meu IP]
         ])
         .split(area);
 
-    // Linha 1: IPv4 / IPv6 / mouse
-    let row_modes = Layout::default()
+    // ── Row 0: branding (left) + status (right) ──────────────────────────────
+    let row0 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Min(0),
-            Constraint::Length(14),
-        ])
+        .constraints([Constraint::Length(20), Constraint::Min(0), Constraint::Length(45)])
         .split(rows[0]);
 
-    let ipv4_button = Button {
-        label: "IPv4".to_string(),
-        area: row_modes[0],
-        action: ButtonAction::SelectIpv4,
-    };
+    let branding_line = Line::from(vec![
+        Span::styled(" ◆ HOLLOW", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  porta ", Style::default().fg(theme.muted)),
+        Span::styled(app.bind_addr.port().to_string(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(branding_line).style(Style::default().bg(theme.bg)),
+        row0[0],
+    );
 
-    let ipv6_button = Button {
-        label: "IPv6".to_string(),
-        area: row_modes[1],
-        action: ButtonAction::SelectIpv6,
-    };
-
-    let mouse_mode_button = Button {
-        label: if app.mouse_capture_enabled {
-            "Cliques: ON".to_string()
-        } else {
-            "Cliques: OFF".to_string()
-        },
-        area: row_modes[3],
-        action: ButtonAction::ToggleMouseMode,
-    };
-
-    let ipv4_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, ipv4_button.area))
-        .unwrap_or(false);
-    let ipv6_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, ipv6_button.area))
-        .unwrap_or(false);
-    let mouse_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, mouse_mode_button.area))
-        .unwrap_or(false);
-
-    let ipv4_enabled = app.mode_supported(IpMode::Ipv4);
-    let ipv6_enabled = app.mode_supported(IpMode::Ipv6);
-
-    let ipv4_style = mode_button_style(theme, app.mode == IpMode::Ipv4, ipv4_hover, ipv4_enabled);
-    let ipv6_style = mode_button_style(theme, app.mode == IpMode::Ipv6, ipv6_hover, ipv6_enabled);
-
-    let mouse_style = if app.mouse_capture_enabled {
-        button_style(theme, theme.ok, mouse_hover, true)
+    // Status in row0[2]
+    let peer_text = if let Some(label) = &app.peer_label {
+        match app.peer_addr {
+            Some(addr) => format!("{label} ({addr})"),
+            None if !app.peer_input.trim().is_empty() => {
+                format!("{label} ({})", app.peer_input.trim())
+            }
+            None => label.clone(),
+        }
+    } else if let Some(addr) = app.peer_addr {
+        addr.to_string()
+    } else if !app.peer_input.trim().is_empty() {
+        app.peer_input.trim().to_string()
     } else {
-        button_style(theme, theme.warn, mouse_hover, true)
+        String::new()
     };
 
-    frame.render_widget(
-        Paragraph::new(ipv4_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(ipv4_style)
-            .block(subtle_block(theme)),
-        ipv4_button.area,
-    );
-
-    frame.render_widget(
-        Paragraph::new(ipv6_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(ipv6_style)
-            .block(subtle_block(theme)),
-        ipv6_button.area,
-    );
-
-    // Dica curta (sem depender de hotkey)
-    let hint = if app.mouse_capture_enabled {
-        "cliques ativos".to_string()
-    } else {
-        "cliques desativados".to_string()
+    let (status_dot_char, status_dot_color) = match &app.connect_status {
+        ConnectStatus::Connected(_) => ("● ", theme.ok),
+        ConnectStatus::Connecting(_) => ("◌ ", theme.warn),
+        ConnectStatus::Timeout(_) | ConnectStatus::Disconnected(_) => ("✕ ", theme.danger),
+        ConnectStatus::Idle => ("○ ", theme.muted),
+    };
+    let status_text_color = match &app.connect_status {
+        ConnectStatus::Connected(_) => theme.ok,
+        ConnectStatus::Connecting(_) => theme.warn,
+        ConnectStatus::Timeout(_) | ConnectStatus::Disconnected(_) => theme.danger,
+        ConnectStatus::Idle => theme.muted,
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" HOLLOW ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("  Modo: ", Style::default().fg(theme.muted)),
-            chip(theme, app.mode_label(), theme.accent),
-            Span::raw("  "),
-            Span::styled(hint, Style::default().fg(theme.muted)),
-        ]))
-        .block(subtle_block(theme))
-        .style(Style::default().bg(theme.panel)),
-        row_modes[2],
-    );
+    let status_label = app.connect_status.label();
+    let mut status_spans: Vec<Span> = vec![
+        Span::styled(status_dot_char, Style::default().fg(status_dot_color)),
+        Span::styled(status_label, Style::default().fg(status_text_color).add_modifier(Modifier::BOLD)),
+    ];
+
+    let peer_text_empty = peer_text.is_empty();
+    if !peer_text_empty {
+        status_spans.push(Span::styled(" a ", Style::default().fg(theme.muted)));
+        status_spans.push(Span::styled(peer_text, Style::default().fg(theme.text)));
+    }
+
+    if matches!(app.connect_status, ConnectStatus::Timeout(_)) {
+        status_spans.push(Span::styled(
+            "  — verifique se o parceiro está ativo",
+            Style::default().fg(theme.muted),
+        ));
+    }
+
+    if matches!(app.connect_status, ConnectStatus::Idle) && peer_text_empty {
+        status_spans.push(Span::styled("aguardando conexão", Style::default().fg(theme.muted)));
+    }
 
     frame.render_widget(
-        Paragraph::new(mouse_mode_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(mouse_style)
-            .block(subtle_block(theme)),
-        mouse_mode_button.area,
+        Paragraph::new(Line::from(status_spans)).style(Style::default().bg(theme.bg)),
+        row0[2],
     );
 
-    // Linha 2: input + colar + conectar + testar
-    let row_top = Layout::default()
+    // ── Row 1: IP input field (left) + [Colar IP] (right, vertically centered) ──
+    let row1 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(20),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(8),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(12)])
         .split(rows[1]);
 
     let input_title = "IP do parceiro";
-    let placeholder = if matches!(app.mode, IpMode::Ipv4) {
-        "ex: 192.0.2.10:12345"
-    } else {
-        "ex: [2001:db8::1]:12345"
-    };
+    let placeholder = "ex: 192.168.1.10:3000 ou [2001:db8::1]:3000";
 
     let input_text = if app.peer_input.is_empty() {
         placeholder.to_string()
@@ -2176,254 +2192,177 @@ fn render_connection_panel(
         Paragraph::new(input_text)
             .style(input_style)
             .block(input_block),
-        row_top[0],
+        row1[0],
     );
 
+    // [Colar IP] vertically centered in the 3-line column
+    let colar_area = Rect {
+        x: row1[1].x,
+        y: row1[1].y + 1, // middle line of 3-line area
+        width: row1[1].width,
+        height: 1,
+    };
+
     let paste_button = Button {
-        label: "Colar".to_string(),
-        area: row_top[1],
+        label: "[Colar IP]".to_string(),
+        area: colar_area,
         action: ButtonAction::PastePeerIp,
     };
 
+    let paste_hover = hover.map(|(x, y)| point_in_rect(x, y, paste_button.area)).unwrap_or(false);
+    render_flat_button(frame, paste_button.area, &paste_button.label, theme.info, paste_hover, true, theme);
+
+    // ── Row 2: [▾ Recentes] | flexible gap | [⚡ Testar] gap [→ Conectar] ──
+    let row2 = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(13),  // [▾ Recentes]
+            Constraint::Min(0),      // flexible gap
+            Constraint::Length(12),  // [⚡ Testar]
+            Constraint::Length(1),   // gap
+            Constraint::Length(14),  // [→ Conectar]
+        ])
+        .split(rows[2]);
+
+    // Fill background for button row
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), rows[2]);
+
+    let recents_label = if app.show_recents { "[▴ Recentes]" } else { "[▾ Recentes]" };
+    let recents_button = Button {
+        label: recents_label.to_string(),
+        area: row2[0],
+        action: ButtonAction::ToggleRecents,
+    };
+
     let connect_label = match &app.connect_status {
-        ConnectStatus::Connecting(_) => "Conectando",
-        ConnectStatus::Connected(_) => "Reconectar",
-        ConnectStatus::Disconnected(_) => "Reconectar",
-        ConnectStatus::Timeout(_) => "Tentar",
-        ConnectStatus::Idle => "Conectar",
+        ConnectStatus::Connecting(_) => "[◌ Aguardando]",
+        ConnectStatus::Connected(_) => "[→ Reconectar]",
+        ConnectStatus::Disconnected(_) => "[→ Reconectar]",
+        ConnectStatus::Timeout(_) => "[→ Tentar]",
+        ConnectStatus::Idle => "[→ Conectar]",
     };
 
     let connect_button = Button {
         label: connect_label.to_string(),
-        area: row_top[2],
+        area: row2[4],
         action: ButtonAction::ConnectPeer,
     };
 
     let probe_button = Button {
-        label: "Testar".to_string(),
-        area: row_top[3],
+        label: "[⚡ Testar]".to_string(),
+        area: row2[2],
         action: ButtonAction::ProbePeer,
     };
 
-    let paste_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, paste_button.area))
-        .unwrap_or(false);
-    let connect_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, connect_button.area))
-        .unwrap_or(false);
-    let probe_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, probe_button.area))
-        .unwrap_or(false);
-
-    frame.render_widget(
-        Paragraph::new(paste_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(button_style(theme, theme.info, paste_hover, true))
-            .block(subtle_block(theme)),
-        paste_button.area,
-    );
-
-    frame.render_widget(
-        Paragraph::new(connect_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(primary_button_style(theme, connect_hover))
-            .block(subtle_block(theme)),
-        connect_button.area,
-    );
-
+    let recents_hover = hover.map(|(x, y)| point_in_rect(x, y, recents_button.area)).unwrap_or(false);
+    let connect_hover = hover.map(|(x, y)| point_in_rect(x, y, connect_button.area)).unwrap_or(false);
+    let probe_hover = hover.map(|(x, y)| point_in_rect(x, y, probe_button.area)).unwrap_or(false);
     let probe_enabled = !app.peer_input.trim().is_empty();
-    frame.render_widget(
-        Paragraph::new(probe_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(button_style(theme, theme.info, probe_hover, probe_enabled))
-            .block(subtle_block(theme)),
-        probe_button.area,
-    );
 
-    // Linha 3: Local + copiar
-    let row_mid = Layout::default()
+    let recents_accent = if app.show_recents { theme.accent } else { theme.info };
+
+    render_flat_button(frame, recents_button.area, &recents_button.label, recents_accent, recents_hover, true, theme);
+    render_flat_button(frame, probe_button.area, &probe_button.label, theme.info, probe_hover, probe_enabled, theme);
+    render_flat_button(frame, connect_button.area, &connect_button.label, theme.accent, connect_hover, true, theme);
+
+    // Dropdown overlay for Recentes — anchor at rows[1] (input area) bottom
+    let mut recent_targets: Vec<RecentClickTarget> = Vec::new();
+    if app.show_recents && !app.recent_profiles.is_empty() {
+        let dropdown_h = app.recent_profiles.len() as u16 + 2;
+        let dropdown_area = Rect {
+            x: rows[1].x,
+            y: rows[1].y + rows[1].height,
+            width: rows[1].width.min(50),
+            height: dropdown_h,
+        };
+
+        let items: Vec<ListItem> = app
+            .recent_profiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let item_area = Rect {
+                    x: dropdown_area.x + 1,
+                    y: dropdown_area.y + 1 + i as u16,
+                    width: dropdown_area.width.saturating_sub(2),
+                    height: 1,
+                };
+                let is_hover = hover
+                    .map(|(x, y)| point_in_rect(x, y, item_area))
+                    .unwrap_or(false);
+                recent_targets.push(RecentClickTarget {
+                    area: item_area,
+                    addr: p.peer.to_string(),
+                });
+                let style = if is_hover {
+                    Style::default().fg(theme.bg).bg(theme.accent)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                ListItem::new(Span::styled(p.peer.to_string(), style))
+            })
+            .collect();
+
+        let dropdown = List::new(items)
+            .block(block_with_title(theme, "Recentes"))
+            .style(Style::default().bg(theme.panel));
+
+        frame.render_widget(dropdown, dropdown_area);
+    }
+    app.recent_click_targets = recent_targets;
+
+    // ── Row 3: "Para compartilhar: addr" (left) + [Copiar meu IP] (right) ──
+    let row3 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(9)])
-        .split(rows[2]);
+        .constraints([Constraint::Min(0), Constraint::Length(16)])
+        .split(rows[3]);
 
-    let local_text = app
-        .current_local_ip()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|| "nao encontrado".to_string());
+    let (addr_text, addr_color) = if let Some(addr_str) = best_sharable_address(app) {
+        (addr_str, theme.text)
+    } else if app.stun_status.is_some() {
+        ("detectando...".to_string(), theme.muted)
+    } else if let Some(local_ip) = app.current_local_ip() {
+        let text = match local_ip {
+            IpAddr::V4(v4) => format!("{}:{}", v4, app.bind_addr.port()),
+            IpAddr::V6(v6) => format!("[{}]:{}", v6, app.bind_addr.port()),
+        };
+        (text, theme.text)
+    } else {
+        ("não disponível".to_string(), theme.muted)
+    };
 
-    let local_line = Line::from(vec![
-        Span::styled("local: ", Style::default().fg(theme.muted)),
-        Span::styled(local_text, title_style(theme)),
+    let share_line = Line::from(vec![
+        Span::styled(" Para compartilhar: ", Style::default().fg(theme.muted)),
+        Span::styled(addr_text, Style::default().fg(addr_color).add_modifier(Modifier::BOLD)),
     ]);
-
     frame.render_widget(
-        Paragraph::new(local_line)
-            .block(block_with_title(theme, "IP local"))
-            .style(Style::default().bg(theme.panel)),
-        row_mid[0],
+        Paragraph::new(share_line).style(Style::default().bg(theme.bg)),
+        row3[0],
     );
 
-    let copy_button = Button {
-        label: "Copiar".to_string(),
-        area: row_mid[1],
-        action: ButtonAction::CopyLocalIp,
+    let copy_best_button = Button {
+        label: "[Copiar meu IP]".to_string(),
+        area: row3[1],
+        action: ButtonAction::CopyBestAddress,
     };
 
     let copy_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, copy_button.area))
+        .map(|(x, y)| point_in_rect(x, y, copy_best_button.area))
         .unwrap_or(false);
-    let copy_enabled = app.current_local_ip().is_some();
+    let copy_enabled = app.current_local_ip().is_some() || app.public_endpoint.is_some();
 
-    frame.render_widget(
-        Paragraph::new(copy_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(button_style(theme, theme.accent, copy_hover, copy_enabled))
-            .block(subtle_block(theme)),
-        copy_button.area,
-    );
+    render_flat_button(frame, copy_best_button.area, &copy_best_button.label, theme.accent, copy_hover, copy_enabled, theme);
 
-    // Linha 4: Público + copiar
-    let row_public = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(9)])
-        .split(rows[3]);
-
-    let public_text = match (app.current_public_endpoint(), app.stun_status.as_deref()) {
-        (Some(addr), _) => addr.to_string(),
-        (None, Some(status)) => status.to_string(),
-        (None, None) => "aguardando STUN".to_string(),
-    };
-
-    let public_line = Line::from(vec![
-        Span::styled("publico: ", Style::default().fg(theme.muted)),
-        Span::styled(public_text, title_style(theme)),
-    ]);
-
-    frame.render_widget(
-        Paragraph::new(public_line)
-            .block(block_with_title(theme, "Endpoint público"))
-            .style(Style::default().bg(theme.panel)),
-        row_public[0],
-    );
-
-    let copy_public_button = Button {
-        label: "Copiar".to_string(),
-        area: row_public[1],
-        action: ButtonAction::CopyPublicEndpoint,
-    };
-
-    let copy_public_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, copy_public_button.area))
-        .unwrap_or(false);
-
-    let copy_public_enabled = app.current_public_endpoint().is_some();
-
-    frame.render_widget(
-        Paragraph::new(copy_public_button.label.as_str())
-            .alignment(Alignment::Center)
-            .style(button_style(
-                theme,
-                theme.info,
-                copy_public_hover,
-                copy_public_enabled,
-            ))
-            .block(subtle_block(theme)),
-        copy_public_button.area,
-    );
-
-    // Linha 5: status curto
-    let row_status = rows[4];
-    let st = status_color(theme, &app.connect_status);
-
-    let peer_text = if let Some(label) = &app.peer_label {
-        match app.peer_addr {
-            Some(addr) => format!("{label} ({addr})"),
-            None if !app.peer_input.trim().is_empty() => {
-                format!("{label} ({})", app.peer_input.trim())
-            }
-            None => label.clone(),
-        }
-    } else if let Some(addr) = app.peer_addr {
-        addr.to_string()
-    } else if !app.peer_input.trim().is_empty() {
-        app.peer_input.trim().to_string()
-    } else {
-        "(sem parceiro)".to_string()
-    };
-
-    let status_line = Line::from(vec![
-        Span::styled("porta ", Style::default().fg(theme.muted)),
-        Span::styled(app.bind_addr.port().to_string(), title_style(theme)),
-        Span::raw("   "),
-        Span::styled("parceiro ", Style::default().fg(theme.muted)),
-        Span::styled(peer_text, Style::default().fg(theme.text)),
-        Span::raw("   "),
-        chip(theme, &app.connect_status.label(), st),
-    ]);
-
-    frame.render_widget(
-        Paragraph::new(status_line)
-            .block(block_with_title(theme, "conexao"))
-            .style(Style::default().bg(theme.panel)),
-        row_status,
-    );
-
-    // Linha 6: assistente
-    if rows[5].height > 0 {
-        let row_assist = rows[5];
-
-    let detected_v4 = app
-        .local_ip
-        .v4
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "nenhum".to_string());
-    let detected_v6 = app
-        .local_ip
-        .v6
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "nenhum".to_string());
-
-    let detected_line = Line::from(vec![
-        Span::styled("v4 ", Style::default().fg(theme.muted)),
-        Span::styled(detected_v4, Style::default().fg(theme.text)),
-        Span::styled(" · ", Style::default().fg(theme.muted)),
-        Span::styled("v6 ", Style::default().fg(theme.muted)),
-        Span::styled(detected_v6, Style::default().fg(theme.text)),
-        Span::styled(" · ", Style::default().fg(theme.muted)),
-        Span::styled(
-            format!("UDP {}", app.bind_addr.port()),
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-
-    let assist_line = Line::from(vec![
-        Span::styled("Ajuda: ", Style::default().fg(theme.muted)),
-        Span::styled(nat_tip_text(app), Style::default().fg(theme.text)),
-        Span::raw("  •  "),
-        Span::styled(probe_summary(app), Style::default().fg(theme.text)),
-    ]);
-
-    frame.render_widget(
-        Paragraph::new(vec![detected_line, assist_line])
-            .block(block_with_title(theme, "assistente de rede"))
-            .style(Style::default().bg(theme.panel)),
-        row_assist,
-    );
-    }
-
-    // Lista completa de botões “clicáveis”
+    // Return input area (row1[0]) and all clickable buttons
     let buttons = vec![
-        ipv4_button,
-        ipv6_button,
-        mouse_mode_button,
+        copy_best_button,
+        paste_button,
+        recents_button,
         connect_button,
         probe_button,
-        paste_button,
-        copy_button,
-        copy_public_button,
     ];
 
-    (row_top[0], buttons)
+    (row1[0], buttons)
 }
 
 fn render_small_ui_button(
@@ -2433,18 +2372,8 @@ fn render_small_ui_button(
     hover: Option<(u16, u16)>,
     theme: Theme,
 ) -> Rect {
-    let is_hover = hover
-        .map(|(x, y)| point_in_rect(x, y, area))
-        .unwrap_or(false);
-
-    let style = button_style(theme, theme.accent, is_hover, true);
-    frame.render_widget(
-        Paragraph::new(label)
-            .alignment(Alignment::Center)
-            .style(style)
-            .block(subtle_block(theme)),
-        area,
-    );
+    let is_hover = hover.map(|(x, y)| point_in_rect(x, y, area)).unwrap_or(false);
+    render_flat_button(frame, area, label, theme.accent, is_hover, true, theme);
     area
 }
 
@@ -2458,51 +2387,35 @@ fn render_transfer_action_buttons(
     app: &AppState,
     theme: Theme,
 ) -> Vec<Button> {
+    let has_pending = app.selected.iter().any(|e| matches!(e.status, OutgoingStatus::Pending));
+
     let row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
+            Constraint::Length(14),  // + Adicionar
+            Constraint::Length(1),
+            Constraint::Length(10),  // Enviar
+            Constraint::Length(1),
+            Constraint::Length(12),  // Cancelar
             Constraint::Min(0),
+            Constraint::Length(8),   // Sair
         ])
         .split(area);
 
-    let has_pending = app
-        .selected
-        .iter()
-        .any(|e| matches!(e.status, OutgoingStatus::Pending));
+    // Fill background
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
 
     let buttons = vec![
-        Button {
-            label: "+ Adicionar".to_string(),
-            area: row[0],
-            action: ButtonAction::AddFiles,
-        },
-        Button {
-            label: "Enviar".to_string(),
-            area: row[1],
-            action: ButtonAction::SendFiles,
-        },
-        Button {
-            label: "Cancelar".to_string(),
-            area: row[2],
-            action: ButtonAction::CancelTransfers,
-        },
-        Button {
-            label: "Sair".to_string(),
-            area: row[3],
-            action: ButtonAction::Quit,
-        },
+        Button { label: "+ Adicionar".to_string(), area: row[0], action: ButtonAction::AddFiles },
+        Button { label: "▶ Enviar".to_string(), area: row[2], action: ButtonAction::SendFiles },
+        Button { label: "✕ Cancelar".to_string(), area: row[4], action: ButtonAction::CancelTransfers },
+        Button { label: "Sair".to_string(), area: row[6], action: ButtonAction::Quit },
     ];
 
-    for button in &buttons {
-        let is_hover = app
-            .last_mouse
-            .map(|(x, y)| point_in_rect(x, y, button.area))
-            .unwrap_or(false);
+    let hover = app.last_mouse;
 
+    for button in &buttons {
+        let is_hover = hover.map(|(x, y)| point_in_rect(x, y, button.area)).unwrap_or(false);
         let (accent, enabled) = match button.action {
             ButtonAction::AddFiles => (theme.accent, true),
             ButtonAction::SendFiles => (theme.ok, has_pending),
@@ -2510,30 +2423,7 @@ fn render_transfer_action_buttons(
             ButtonAction::Quit => (theme.danger, true),
             _ => (theme.accent, true),
         };
-
-        let style = if matches!(button.action, ButtonAction::Quit) {
-            if is_hover {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.danger)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(theme.danger)
-                    .bg(theme.panel)
-                    .add_modifier(Modifier::BOLD)
-            }
-        } else {
-            button_style(theme, accent, is_hover, enabled)
-        };
-
-        frame.render_widget(
-            Paragraph::new(button.label.as_str())
-                .alignment(Alignment::Center)
-                .style(style)
-                .block(subtle_block(theme)),
-            button.area,
-        );
+        render_flat_button(frame, button.area, &button.label, accent, is_hover, enabled, theme);
     }
 
     buttons

@@ -56,13 +56,6 @@ pub enum WireMessage {
         ok: bool,
         reason: Option<String>,
     },
-    FileChunk {
-        file_id: u64,
-        data: Vec<u8>,
-    },
-    FileDone {
-        file_id: u64,
-    },
     ObservedEndpoint {
         addr: SocketAddr,
     },
