@@ -83,11 +83,12 @@ jobs:
         with:
           path: artifacts
 
-      - name: Rename artifacts
+      - name: Prepare release assets
         run: |
-          mv artifacts/Hollow-linux-x86_64/Hollow        artifacts/Hollow-linux-x86_64
-          mv artifacts/Hollow-windows-x86_64.exe/Hollow.exe artifacts/Hollow-windows-x86_64.exe
-          chmod +x artifacts/Hollow-linux-x86_64
+          mkdir release
+          cp artifacts/Hollow-linux-x86_64/Hollow        release/Hollow-linux-x86_64
+          cp artifacts/Hollow-windows-x86_64.exe/Hollow.exe release/Hollow-windows-x86_64.exe
+          chmod +x release/Hollow-linux-x86_64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -103,6 +104,6 @@ jobs:
 
             **Commit:** ${{ github.event.head_commit.message }}
           files: |
-            artifacts/Hollow-linux-x86_64
-            artifacts/Hollow-windows-x86_64.exe
+            release/Hollow-linux-x86_64
+            release/Hollow-windows-x86_64.exe
           fail_on_unmatched_files: true
