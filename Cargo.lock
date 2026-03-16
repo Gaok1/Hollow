@@ -1356,6 +1356,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2p-connection"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bincode",
+ "get_if_addrs",
+ "quinn",
+ "rcgen",
+ "ring",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
