@@ -58,6 +58,16 @@ jobs:
       - name: Build daemon
         run: cargo build --release --bin hollow-core
 
+      # steamworks-sys leaves the redistributable in its build-script output;
+      # stage it where electron-builder's extraResources expects it.
+      - name: Stage Steam runtime
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem target/release/build/steamworks-sys-*/out/steam_api64.dll |
+            Select-Object -First 1
+          if (-not $dll) { throw "steam_api64.dll was not emitted by steamworks-sys" }
+          Copy-Item -LiteralPath $dll.FullName target/release/steam_api64.dll
+
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm install --no-audit --no-fund
