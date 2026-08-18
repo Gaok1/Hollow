@@ -11,18 +11,27 @@ jobs:
       version: ${{ steps.extract.outputs.version }}
       should_release: ${{ steps.extract.outputs.should_release }}
     steps:
+      # The message arrives through the environment, never spliced into the
+      # script by ${{ }}. Interpolation happens before bash sees the file, so a
+      # commit message is source code to it: one containing a backtick has its
+      # contents run, and one containing a quote ends the string early and
+      # fails the step. Both happened.
       - name: Extract version from commit message
         id: extract
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          MSG="${{ github.event.head_commit.message }}"
-          VERSION=$(echo "$MSG" | grep -oP 'v\d+\.\d+\.\d+' | head -1)
+          # Subject line only. A body that discusses an older release — which
+          # is most fix commits — must not decide what gets tagged.
+          SUBJECT=$(printf '%s' "$HEAD_COMMIT_MESSAGE" | head -1)
+          VERSION=$(printf '%s' "$SUBJECT" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
           if [ -n "$VERSION" ]; then
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "Found version: $VERSION"
           else
-            echo "should_release=false" >> $GITHUB_OUTPUT
-            echo "No version tag in commit message, skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No version in the subject line, skipping release."
           fi
 
   # Hollow is Windows-only: the audio engine is built directly on WASAPI and
