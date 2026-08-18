@@ -42,6 +42,17 @@ const api = {
     },
   },
 
+  /**
+   * Hollow's log file, shared by the daemon, the main process and the page.
+   * A call that fails on someone else's machine is only diagnosable if the
+   * renderer's side of it was written down too.
+   */
+  log: {
+    write: (line: string): void => ipcRenderer.send('log:write', line),
+    open: (): Promise<void> => ipcRenderer.invoke('log:open'),
+    reveal: (): Promise<void> => ipcRenderer.invoke('log:reveal'),
+  },
+
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     maximize: () => ipcRenderer.invoke('window:maximize'),

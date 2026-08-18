@@ -35,10 +35,12 @@ export class Sidecar extends EventEmitter {
     this.child.stdout.on('data', (chunk: string) => this.consume(chunk))
 
     // The daemon logs to stderr precisely so it never corrupts the JSON stream.
+    // An installed build has no console attached, so this is emitted rather
+    // than printed: the main process is what decides where it lands.
     this.child.stderr.setEncoding('utf8')
     this.child.stderr.on('data', (chunk: string) => {
       for (const line of chunk.split('\n')) {
-        if (line.trim()) console.log('[hollow-core]', line)
+        if (line.trim()) this.emit('log', line.trim())
       }
     })
 
@@ -62,7 +64,7 @@ export class Sidecar extends EventEmitter {
       try {
         message = JSON.parse(line)
       } catch {
-        console.warn('[hollow-core] unparseable line:', line.slice(0, 200))
+        this.emit('log', `unparseable line: ${line.slice(0, 200)}`)
         continue
       }
 

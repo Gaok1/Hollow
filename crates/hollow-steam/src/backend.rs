@@ -57,6 +57,10 @@ pub enum SteamEvent {
     },
     /// Non-fatal problem worth surfacing in the UI.
     Error(String),
+    /// Transport detail worth writing down but not worth interrupting anyone
+    /// over: session accepted, session restarted, relay came up. A call that
+    /// fails quietly is only debuggable if this trail exists.
+    Diagnostic(String),
 }
 
 /// Which implementation is live, so the UI can say so honestly.

@@ -57,13 +57,50 @@ const CAMERA_FLOOR_BPS = 200_000
  */
 const OFFER_RETRY_MS = 1_500
 const OFFER_RETRIES = 6
+/**
+ * After the fast attempts, keep asking — slowly, and for as long as the link is
+ * still waiting on an answer.
+ *
+ * Giving up at nine seconds leaves a call that cannot recover without everyone
+ * leaving and rejoining, and the thing being waited on (Steam's relay network
+ * coming up on a cold client) can take longer than that. The cost of not giving
+ * up is one small message every five seconds; the cost of giving up is the
+ * call.
+ */
+const OFFER_RETRY_SLOW_MS = 5_000
+
+/**
+ * Everything the UI needs to say what a link is actually doing.
+ *
+ * `connectionState` alone cannot tell "we are still trying" apart from "we
+ * agreed on a session and no media is coming", and those two have different
+ * causes and different answers. Reporting the whole picture is what lets a
+ * stuck call say which half is stuck.
+ */
+export interface LinkHealth {
+  connection: RTCPeerConnectionState
+  ice: RTCIceConnectionState
+  /** True once both sides have a session: we answered, or we were answered. */
+  negotiated: boolean
+  /** Remote slots delivering media right now. Empty on a connected but silent link. */
+  receiving: TrackSlot[]
+  /** Offers sent with no answer back. Non-zero means signaling is being lost. */
+  unansweredOffers: number
+  /** Which kinds of local candidate ICE found. No `srflx` means STUN never answered. */
+  candidates: Record<string, number>
+  /** When the link was opened, so the UI can say how long this has been going on. */
+  since: number
+}
 
 export interface MeshEvents {
   /** A remote track arrived or was replaced. `track` is null when it stopped. */
   onTrack(peerId: string, slot: TrackSlot, track: MediaStreamTrack | null): void
-  onConnectionState(peerId: string, state: RTCPeerConnectionState): void
+  /** The link's state changed in a way worth showing. */
+  onHealth(peerId: string, health: LinkHealth): void
   /** Send a signaling payload to one peer via the Steam channel. */
   send(peerId: string, payload: unknown): void
+  /** One line for the log file. A call that fails silently is not debuggable. */
+  log(line: string): void
 }
 
 interface Link {
@@ -75,6 +112,9 @@ interface Link {
   remoteDescriptionSet: boolean
   /** Pending offer re-send, cleared once an answer arrives. */
   offerRetry: ReturnType<typeof setTimeout> | null
+  health: LinkHealth
+  /** Remote slots currently unmuted, backing `health.receiving`. */
+  live: Set<TrackSlot>
 }
 
 export class Mesh {
@@ -105,6 +145,9 @@ export class Mesh {
 
     const link = this.createLink(peerId)
     this.links.set(peerId, link)
+    this.events.log(
+      `link ${peerId}: opened as ${this.isOfferer(peerId) ? 'offerer' : 'answerer'}`,
+    )
 
     if (this.isOfferer(peerId)) {
       await this.sendOffer(peerId, link)
@@ -118,6 +161,7 @@ export class Mesh {
     this.links.delete(peerId)
     if (link.offerRetry) clearTimeout(link.offerRetry)
     link.pc.close()
+    this.events.log(`link ${peerId}: closed`)
     for (const { slot } of LAYOUT) this.events.onTrack(peerId, slot, null)
     this.retuneBitrates()
   }
@@ -136,6 +180,9 @@ export class Mesh {
     this.local[slot] = track
     const index = LAYOUT.findIndex((entry) => entry.slot === slot)
     if (index < 0) return
+    this.events.log(
+      `local ${slot}: ${track ? 'published' : 'cleared'} to ${this.links.size} peer(s)`,
+    )
 
     await Promise.all(
       [...this.links.values()].map(async (link) => {
@@ -144,7 +191,7 @@ export class Mesh {
         try {
           await sender.replaceTrack(track)
         } catch (err) {
-          console.warn(`replaceTrack(${slot}) failed`, err)
+          this.events.log(`replaceTrack(${slot}) failed — ${err}`)
         }
       }),
     )
@@ -162,9 +209,13 @@ export class Mesh {
     let link = this.links.get(peerId)
     if (!link) {
       // An offer can beat the room update that tells us this peer exists.
-      if (message.kind !== 'offer') return
+      if (message.kind !== 'offer') {
+        this.events.log(`link ${peerId}: dropped a ${message.kind} for an unknown peer`)
+        return
+      }
       link = this.createLink(peerId)
       this.links.set(peerId, link)
+      this.events.log(`link ${peerId}: opened by their offer`)
     }
 
     try {
@@ -177,6 +228,9 @@ export class Mesh {
           const answer = await link.pc.createAnswer()
           await link.pc.setLocalDescription(answer)
           this.events.send(peerId, { kind: 'answer', sdp: link.pc.localDescription })
+          link.health.negotiated = true
+          this.report(peerId, link)
+          this.events.log(`link ${peerId}: answered their offer`)
           break
         }
         case 'answer': {
@@ -188,6 +242,10 @@ export class Mesh {
             link.offerRetry = null
           }
           await this.flushCandidates(link)
+          link.health.negotiated = true
+          link.health.unansweredOffers = 0
+          this.report(peerId, link)
+          this.events.log(`link ${peerId}: answer received`)
           break
         }
         case 'ice': {
@@ -202,7 +260,7 @@ export class Mesh {
         }
       }
     } catch (err) {
-      console.error(`signaling from ${peerId} failed`, err)
+      this.events.log(`link ${peerId}: signaling (${message.kind}) failed — ${err}`)
     }
   }
 
@@ -258,6 +316,16 @@ export class Mesh {
       earlyCandidates: [],
       remoteDescriptionSet: false,
       offerRetry: null,
+      live: new Set(),
+      health: {
+        connection: pc.connectionState,
+        ice: pc.iceConnectionState,
+        negotiated: false,
+        receiving: [],
+        unansweredOffers: 0,
+        candidates: {},
+        since: Date.now(),
+      },
     }
 
     // Attach whatever is already live locally.
@@ -268,8 +336,20 @@ export class Mesh {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        // Counting these by type is the cheapest NAT diagnosis there is: no
+        // `srflx` means STUN never answered and nothing beyond the local
+        // network will ever connect; no `relay` with a TURN server configured
+        // means the relay is not working either.
+        const type = event.candidate.type ?? 'unknown'
+        link.health.candidates[type] = (link.health.candidates[type] ?? 0) + 1
         this.events.send(peerId, { kind: 'ice', candidate: event.candidate.toJSON() })
+        return
       }
+      // A null candidate is the end of gathering.
+      this.report(peerId, link)
+      this.events.log(
+        `link ${peerId}: gathered ${JSON.stringify(link.health.candidates)}`,
+      )
     }
 
     pc.ontrack = (event) => {
@@ -287,15 +367,41 @@ export class Mesh {
       // in every tile, and leave the last frame of a camera or a screen share
       // frozen on screen after it was turned off.
       const track = event.track
-      const publish = () => this.events.onTrack(peerId, slot, track.muted ? null : track)
-      track.onunmute = publish
-      track.onmute = publish
-      track.onended = () => this.events.onTrack(peerId, slot, null)
+      const publish = () => {
+        const flowing = !track.muted
+        if (flowing) link.live.add(slot)
+        else link.live.delete(slot)
+        link.health.receiving = [...link.live]
+        this.events.onTrack(peerId, slot, flowing ? track : null)
+        this.report(peerId, link)
+      }
+      track.onunmute = () => {
+        this.events.log(`link ${peerId}: ${slot} is live`)
+        publish()
+      }
+      track.onmute = () => {
+        this.events.log(`link ${peerId}: ${slot} went quiet`)
+        publish()
+      }
+      track.onended = () => {
+        link.live.delete(slot)
+        link.health.receiving = [...link.live]
+        this.events.onTrack(peerId, slot, null)
+        this.report(peerId, link)
+      }
       publish()
     }
 
+    pc.oniceconnectionstatechange = () => {
+      link.health.ice = pc.iceConnectionState
+      this.report(peerId, link)
+      this.events.log(`link ${peerId}: ice ${pc.iceConnectionState}`)
+    }
+
     pc.onconnectionstatechange = () => {
-      this.events.onConnectionState(peerId, pc.connectionState)
+      link.health.connection = pc.connectionState
+      this.report(peerId, link)
+      this.events.log(`link ${peerId}: connection ${pc.connectionState}`)
       if (pc.connectionState === 'failed') {
         // ICE restart is the standard recovery and keeps the m-line layout, so
         // no tracks are disturbed.
@@ -303,7 +409,13 @@ export class Mesh {
       }
     }
 
+    this.report(peerId, link)
     return link
+  }
+
+  /** Hand the current picture of a link to the UI. */
+  private report(peerId: string, link: Link): void {
+    this.events.onHealth(peerId, { ...link.health, candidates: { ...link.health.candidates } })
   }
 
   private async sendOffer(peerId: string, link: Link): Promise<void> {
@@ -311,9 +423,10 @@ export class Mesh {
       const offer = await link.pc.createOffer()
       await link.pc.setLocalDescription(offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.events.log(`link ${peerId}: offer sent`)
       this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
-      console.error(`could not offer to ${peerId}`, err)
+      this.events.log(`link ${peerId}: could not create an offer — ${err}`)
     }
   }
 
@@ -328,20 +441,22 @@ export class Mesh {
    */
   private scheduleOfferRetry(peerId: string, link: Link, attempt: number): void {
     if (link.offerRetry) clearTimeout(link.offerRetry)
-    if (attempt > OFFER_RETRIES) {
-      link.offerRetry = null
-      return
-    }
+
+    // Nothing here leaks: the timer stops itself once the link is replaced or
+    // leaves `have-local-offer`, and `disconnect` clears it outright.
+    const delay = attempt <= OFFER_RETRIES ? OFFER_RETRY_MS : OFFER_RETRY_SLOW_MS
 
     link.offerRetry = setTimeout(() => {
       link.offerRetry = null
       if (this.links.get(peerId) !== link) return
       if (link.pc.signalingState !== 'have-local-offer') return
 
-      console.warn(`no answer from ${peerId}; re-sending offer (${attempt})`)
+      link.health.unansweredOffers = attempt
+      this.report(peerId, link)
+      this.events.log(`link ${peerId}: no answer, re-sending offer (${attempt})`)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
       this.scheduleOfferRetry(peerId, link, attempt + 1)
-    }, OFFER_RETRY_MS)
+    }, delay)
   }
 
   private async restartIce(peerId: string, link: Link): Promise<void> {
@@ -350,9 +465,10 @@ export class Mesh {
       const offer = await link.pc.createOffer({ iceRestart: true })
       await link.pc.setLocalDescription(offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.events.log(`link ${peerId}: ICE restart offered`)
       this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
-      console.error(`ICE restart for ${peerId} failed`, err)
+      this.events.log(`link ${peerId}: ICE restart failed — ${err}`)
     }
   }
 
@@ -362,7 +478,7 @@ export class Mesh {
       try {
         await link.pc.addIceCandidate(candidate)
       } catch (err) {
-        console.warn('queued candidate rejected', err)
+        this.events.log(`queued candidate rejected — ${err}`)
       }
     }
   }

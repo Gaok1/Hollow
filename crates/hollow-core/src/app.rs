@@ -121,6 +121,7 @@ impl App {
                 "appId": self.app_id,
                 "capabilities": self.caps,
                 "audioPipe": crate::pipe::pipe_name(),
+                "version": env!("CARGO_PKG_VERSION"),
                 "room": self.room,
             })),
 
@@ -367,6 +368,12 @@ impl App {
 
             SteamEvent::Error(message) => {
                 self.sink.emit_error(message).await;
+            }
+
+            SteamEvent::Diagnostic(message) => {
+                self.sink
+                    .emit("log", json!({ "source": "steam", "message": message }))
+                    .await;
             }
         }
         Ok(())

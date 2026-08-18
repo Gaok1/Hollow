@@ -207,6 +207,25 @@ export class BroadcastAudio {
 }
 
 /**
+ * One `AudioContext` shared by every meter on the page.
+ *
+ * A meter used to open its own, which is fine at one or two and stops being
+ * fine in a full room: one per tile, plus the control bar, plus the broadcast
+ * mixer. Analysers are cheap, contexts are not, and Chromium caps how many a
+ * document may hold at once.
+ */
+let meterContext: AudioContext | null = null
+
+function sharedMeterContext(): AudioContext {
+  if (!meterContext || meterContext.state === 'closed') {
+    meterContext = new AudioContext()
+  }
+  // Autoplay policy can leave it suspended until the page is interacted with.
+  void meterContext.resume().catch(() => {})
+  return meterContext
+}
+
+/**
  * Watch how loud a track is, for the speaking indicator and mixer meters.
  *
  * @returns a stop function.
@@ -215,7 +234,7 @@ export function meterTrack(
   track: MediaStreamTrack,
   onLevel: (level: number) => void,
 ): () => void {
-  const context = new AudioContext()
+  const context = sharedMeterContext()
   const source = context.createMediaStreamSource(new MediaStream([track]))
   const analyser = context.createAnalyser()
   analyser.fftSize = 512
@@ -242,7 +261,8 @@ export function meterTrack(
     running = false
     cancelAnimationFrame(raf)
     source.disconnect()
-    void context.close()
+    analyser.disconnect()
+    // The context is shared, so it outlives this meter deliberately.
   }
 }
 

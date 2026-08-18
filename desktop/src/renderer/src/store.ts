@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { Mesh } from './lib/mesh'
+import { Mesh, type LinkHealth } from './lib/mesh'
 import { BroadcastAudio, openCamera, openMicrophone, openScreen } from './lib/media'
 import type {
   AppInfo,
@@ -21,6 +21,16 @@ const broadcastAudio = new BroadcastAudio()
 
 const rpc = <T = unknown,>(method: string, params?: unknown): Promise<T> =>
   window.hollow.request(method, params) as Promise<T>
+
+/**
+ * Write one line to Hollow's log file.
+ *
+ * The renderer is where a call actually fails, and an installed build has no
+ * console to fail into. Everything that would have been a `console.warn` about
+ * signaling, media or devices goes here instead, so a call that connected to
+ * nobody can be read back afterwards.
+ */
+const log = (line: string): void => window.hollow.log.write(line)
 
 export interface Toast {
   id: number
@@ -84,7 +94,8 @@ interface State {
   room: Room | null
   /** Remote presence, keyed by SteamID64. */
   presence: Record<string, Presence>
-  connection: Record<string, RTCPeerConnectionState>
+  /** What each link is doing, keyed by SteamID64. Drives every status the UI shows. */
+  health: Record<string, LinkHealth>
   remoteTracks: Record<string, Partial<Record<TrackSlot, MediaStreamTrack>>>
 
   local: Partial<Record<TrackSlot, MediaStreamTrack>>
@@ -124,6 +135,9 @@ interface State {
   setSessionVolume(pid: number, volume: number, muted: boolean): Promise<void>
   setMasterGain(gain: number): Promise<void>
 
+  refreshFriends(): Promise<void>
+  openLog(): Promise<void>
+  revealLog(): Promise<void>
   updateSettings(patch: Partial<Settings>): void
   setPinned(peerId: string | null): void
   toggle(panel: 'settings' | 'mixer'): void
@@ -142,7 +156,7 @@ export const useStore = create<State>((set, get) => ({
   friends: [],
   room: null,
   presence: {},
-  connection: {},
+  health: {},
   remoteTracks: {},
   local: {},
   localPresence: {
@@ -184,11 +198,14 @@ export const useStore = create<State>((set, get) => ({
               else delete next[slot]
               return { remoteTracks: { ...s.remoteTracks, [peerId]: next } }
             }),
-          onConnectionState: (peerId, state) =>
-            set((s) => ({ connection: { ...s.connection, [peerId]: state } })),
+          onHealth: (peerId, health) =>
+            set((s) => ({ health: { ...s.health, [peerId]: health } })),
           send: (peerId, signalPayload) => {
-            void rpc('signal.send', { to: peerId, payload: signalPayload })
+            void rpc('signal.send', { to: peerId, payload: signalPayload }).catch((err) =>
+              log(`signal.send to ${peerId} failed — ${err}`),
+            )
           },
+          log,
         },
         iceServers(get().settings),
       )
@@ -206,8 +223,9 @@ export const useStore = create<State>((set, get) => ({
       set({ room })
 
       if (!room) {
+        log('room: left')
         mesh?.closeAll()
-        set({ remoteTracks: {}, connection: {}, presence: {}, pinned: null })
+        set({ remoteTracks: {}, health: {}, presence: {}, pinned: null })
         void get().stopShare()
         return
       }
@@ -217,10 +235,16 @@ export const useStore = create<State>((set, get) => ({
       // events are just faster.
       const me = get().me?.id
       const wanted = new Set(room.members.map((m) => m.id).filter((id) => id !== me))
+      log(`room: ${room.name} with ${room.members.length} member(s)`)
       for (const id of wanted) void mesh?.connect(id)
       for (const id of mesh?.peerIds ?? []) {
         if (!wanted.has(id)) mesh?.disconnect(id)
       }
+      // Health entries outlive their links otherwise, and a stale "Connecting"
+      // badge on someone who already left is worse than no badge.
+      set((s) => ({
+        health: Object.fromEntries(Object.entries(s.health).filter(([id]) => wanted.has(id))),
+      }))
       if (!previous) {
         // Publish our starting state so late tiles are not blank.
         void rpc('presence.set', get().localPresence)
@@ -270,8 +294,10 @@ export const useStore = create<State>((set, get) => ({
           mesh?.disconnect(id)
           set((s) => {
             const remoteTracks = { ...s.remoteTracks }
+            const health = { ...s.health }
             delete remoteTracks[id]
-            return { remoteTracks, pinned: s.pinned === id ? null : s.pinned }
+            delete health[id]
+            return { remoteTracks, health, pinned: s.pinned === id ? null : s.pinned }
           })
           break
         }
@@ -346,6 +372,7 @@ export const useStore = create<State>((set, get) => ({
 
         case 'error': {
           const { message, fatal } = data as { message: string; fatal?: boolean }
+          log(`core error${fatal ? ' (fatal)' : ''}: ${message}`)
           if (fatal) set({ fatal: message })
           else pushToast({ kind: 'error', message })
           break
@@ -363,16 +390,38 @@ export const useStore = create<State>((set, get) => ({
       // A reload during a call: rebuild the mesh from the room the daemon is
       // still in, which it will not announce again on its own.
       if (info.room) applyRoom(info.room)
-    } catch {
+    } catch (err) {
       // Daemon not up yet; its own `ready` event will do this instead.
+      log(`app.info failed, waiting for the daemon's ready event — ${err}`)
     }
+
+    // The daemon pushes the friends list once, at its own startup — which is
+    // before this window exists, so that first push lands nowhere. After it the
+    // list is only re-sent when something about a friend actually changes,
+    // which is why the sidebar could sit empty until an unrelated Steam event
+    // (accepting an invite, a friend launching a game) shook it loose. Ask.
+    await get().refreshFriends()
+  },
+
+  async refreshFriends() {
+    await rpc('friends.refresh').catch((err) => log(`friends.refresh failed — ${err}`))
+  },
+
+  async openLog() {
+    await window.hollow.log.open()
+  },
+
+  async revealLog() {
+    await window.hollow.log.reveal()
   },
 
   async createRoom(name) {
+    log('room: creating')
     await rpc('room.create', { name, maxMembers: 6 })
   },
 
   async joinRoom(id) {
+    log(`room: joining ${id}`)
     await rpc('room.join', { id })
   },
 
@@ -425,6 +474,7 @@ export const useStore = create<State>((set, get) => ({
       set({ local: { ...local, mic: track }, localPresence: presence })
       await rpc('presence.set', presence)
     } catch (err) {
+      log(`microphone failed — ${err}`)
       set((s) => ({
         toasts: [
           ...s.toasts,
@@ -473,6 +523,7 @@ export const useStore = create<State>((set, get) => ({
       set({ local: { ...local, camera: track }, localPresence: presence })
       await rpc('presence.set', presence)
     } catch (err) {
+      log(`camera failed — ${err}`)
       set((s) => ({
         toasts: [
           ...s.toasts,
@@ -536,6 +587,7 @@ export const useStore = create<State>((set, get) => ({
       })
       await rpc('presence.set', presence)
     } catch (err) {
+      log(`screen share failed — ${err}`)
       set((s) => ({
         toasts: [
           ...s.toasts,

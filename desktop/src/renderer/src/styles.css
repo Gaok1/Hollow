@@ -250,6 +250,24 @@ select {
   opacity: 0.6;
 }
 
+/* Pushed to the far edge so the heading still reads as a heading. */
+.sidebar__refresh {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 2px;
+  transition: color 130ms var(--ease), transform 300ms var(--ease);
+}
+
+.sidebar__refresh:hover {
+  color: var(--text);
+  transform: rotate(90deg);
+}
+
 .sidebar__friends ul {
   list-style: none;
 }
@@ -258,6 +276,11 @@ select {
   color: var(--text-faint);
   font-size: 12.5px;
   padding: 12px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  line-height: 1.5;
 }
 
 .friend {
@@ -497,6 +520,72 @@ select {
   justify-content: center;
 }
 
+/*
+ * Sits above the tiles rather than over them: this is information about the
+ * call, not about any one person in it, and covering a face to say so would be
+ * the wrong trade.
+ */
+.callstatus {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+/* Amber only once Hollow has something to say. A warning that shows up
+   immediately teaches people to ignore warnings. */
+.callstatus--warn {
+  align-items: flex-start;
+  border-color: rgba(255, 179, 64, 0.28);
+  background: var(--warn-dim);
+  color: var(--text);
+}
+
+.callstatus--warn > svg {
+  color: var(--warn);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.callstatus__text {
+  flex: 1;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.callstatus__text strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.callstatus__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.callstatus__spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .tile {
   position: relative;
   background: var(--surface);
@@ -535,7 +624,16 @@ select {
   height: 100%;
   display: grid;
   place-items: center;
+  gap: 10px;
+  align-content: center;
   background: radial-gradient(circle at 50% 40%, var(--surface-raised), var(--surface));
+}
+
+.tile__waiting {
+  font-size: 11px;
+  color: var(--warn);
+  text-align: center;
+  padding: 0 10px;
 }
 
 .tile__overlay {
@@ -733,6 +831,8 @@ select {
 }
 
 .control {
+  position: relative;
+  overflow: hidden;
   width: var(--control-h);
   height: var(--control-h);
   display: grid;
@@ -759,6 +859,22 @@ select {
   background: var(--accent-dim);
   border-color: var(--accent-line);
   color: var(--accent);
+}
+
+/*
+ * A level bar rather than a ring: it reads at a glance from the corner of the
+ * eye, which is the only attention this ever gets during a call.
+ */
+.control__level {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--accent);
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 90ms linear;
 }
 
 .control--danger {
@@ -976,7 +1092,8 @@ select {
   gap: 6px;
 }
 
-.field label {
+.field label,
+.field__label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1003,6 +1120,55 @@ select {
   font-size: 11px;
   line-height: 1.45;
   color: var(--text-faint);
+}
+
+.diag {
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.diag__row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  font-size: 11.5px;
+}
+
+.diag__name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diag__state {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.diag__state--connected {
+  color: var(--accent);
+}
+
+.diag__state--failed,
+.diag__state--closed {
+  color: var(--danger);
+}
+
+.diag__state--disconnected {
+  color: var(--warn);
+}
+
+/* Spans both columns: this line is dense on purpose and needs the width. */
+.diag__detail {
+  grid-column: 1 / -1;
+  color: var(--text-faint);
+  line-height: 1.5;
 }
 
 .about {

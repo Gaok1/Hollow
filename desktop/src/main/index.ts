@@ -1,3 +1,4 @@
+import { appendFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BrowserWindow, app, desktopCapturer, ipcMain, session, shell } from 'electron'
 import { Sidecar } from './sidecar'
@@ -19,6 +20,39 @@ const audioPipe = new AudioPipe()
  * renderer mid-flight, so the choice is staged here.
  */
 let pendingScreenSource: string | null = null
+
+/**
+ * Where a failed call explains itself.
+ *
+ * An installed build has no console: the daemon's stderr and the renderer's
+ * WebRTC trace both go nowhere, which leaves "nobody could hear anything" with
+ * no evidence attached to it. Both ends append here instead, and Settings can
+ * open the file.
+ */
+const logPath = join(app.getPath('userData'), 'hollow.log')
+
+function log(source: string, line: string): void {
+  try {
+    appendFileSync(logPath, `${new Date().toISOString()} [${source}] ${line}\n`)
+  } catch {
+    // Logging must never be the thing that breaks a call.
+  }
+}
+
+/**
+ * Start each run with an empty file.
+ *
+ * The question this log answers is always about the session that just failed,
+ * and a file that grows across every run is one nobody scrolls back through.
+ */
+function startLog(): void {
+  try {
+    writeFileSync(logPath, '')
+    log('app', `Hollow ${app.getVersion()} on ${process.platform} ${process.getSystemVersion()}`)
+  } catch {
+    // Same rule: never fatal.
+  }
+}
 
 function createWindow(): void {
   window = new BrowserWindow({
@@ -98,16 +132,27 @@ function configureSession(): void {
 }
 
 app.whenReady().then(() => {
+  startLog()
   configureSession()
   createWindow()
 
   sidecar.on('event', (name: string, data: unknown) => {
+    // The daemon's own diagnostics stop here: they are for the file, and
+    // forwarding them would only give the renderer a case it has to ignore.
+    if (name === 'log') {
+      const entry = data as { source?: string; message?: string }
+      log(entry.source ?? 'core', entry.message ?? '')
+      return
+    }
     window?.webContents.send('core:event', name, data)
   })
+  sidecar.on('log', (line: string) => log('core', line))
   sidecar.on('fatal', (err: Error) => {
+    log('core', `fatal: ${err.message}`)
     window?.webContents.send('core:event', 'error', { message: err.message, fatal: true })
   })
   sidecar.on('exit', (code: number | null) => {
+    log('core', `hollow-core exited with code ${code}`)
     window?.webContents.send('core:event', 'error', {
       message: `hollow-core stopped (code ${code}). Restart Hollow.`,
       fatal: true,
@@ -168,6 +213,22 @@ ipcMain.handle('audio:connect', (_e, pipeName: string) => {
 })
 
 ipcMain.handle('audio:disconnect', () => audioPipe.stop())
+
+/**
+ * The renderer's half of the log.
+ *
+ * WebRTC only explains itself from inside the page — which peer answered, which
+ * ICE state it reached, which track arrived — and none of that survives in an
+ * installed build. `send` rather than `invoke` because a signaling trace should
+ * not cost a promise per line.
+ */
+ipcMain.on('log:write', (_e, line: string) => log('ui', line))
+
+/** Open the log in whatever the OS uses for text files. */
+ipcMain.handle('log:open', () => shell.openPath(logPath))
+
+/** Show it in Explorer instead, for when it needs to be attached to something. */
+ipcMain.handle('log:reveal', () => shell.showItemInFolder(logPath))
 
 ipcMain.handle('window:minimize', () => window?.minimize())
 ipcMain.handle('window:maximize', () => {

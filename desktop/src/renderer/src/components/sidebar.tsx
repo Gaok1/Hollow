@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useStore } from '../store'
 import type { Peer } from '../types'
-import { PlusIcon, SteamIcon } from './icons'
+import { PlusIcon, RefreshIcon, SteamIcon } from './icons'
 
 /** Steam avatars are not always available; fall back to an initial. */
 function Avatar({ peer, size = 32 }: { peer: Peer; size?: number }) {
@@ -69,6 +69,7 @@ export function Sidebar() {
   const friends = useStore((s) => s.friends)
   const room = useStore((s) => s.room)
   const createRoom = useStore((s) => s.createRoom)
+  const refreshFriends = useStore((s) => s.refreshFriends)
   const [filter, setFilter] = useState('')
 
   const [inHollow, others] = useMemo(() => {
@@ -130,6 +131,14 @@ export function Sidebar() {
 
         <h2 className="sidebar__heading">
           Friends <span className="count">{others.length}</span>
+          <button
+            className="sidebar__refresh"
+            onClick={() => void refreshFriends()}
+            title="Reload from Steam"
+            aria-label="Reload friends from Steam"
+          >
+            <RefreshIcon />
+          </button>
         </h2>
         <ul>
           {others.map((peer) => (
@@ -138,9 +147,15 @@ export function Sidebar() {
         </ul>
 
         {friends.length === 0 && (
-          <p className="sidebar__empty">
-            No friends loaded yet. Hollow reads your Steam friends list.
-          </p>
+          <div className="sidebar__empty">
+            <p>
+              No friends loaded yet. Steam fills this in a moment or two after it
+              finishes signing in.
+            </p>
+            <button className="btn btn--ghost btn--tiny" onClick={() => void refreshFriends()}>
+              Reload from Steam
+            </button>
+          </div>
         )}
       </nav>
     </aside>

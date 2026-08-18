@@ -156,12 +156,54 @@ export function MixerPanel() {
   )
 }
 
+/**
+ * Per-peer link state, in the terms that identify a fault rather than restate
+ * it: whether the two sides agreed a session, what ICE settled on, what media
+ * is arriving, and which candidate types were found at all.
+ */
+function Diagnostics() {
+  const room = useStore((s) => s.room)
+  const me = useStore((s) => s.me)
+  const health = useStore((s) => s.health)
+
+  const peers = (room?.members ?? []).filter((m) => m.id !== me?.id)
+  if (peers.length === 0) {
+    return <p className="field__hint">Nothing to report — you are not in a call with anyone.</p>
+  }
+
+  return (
+    <ul className="diag">
+      {peers.map((peer) => {
+        const link = health[peer.id]
+        const candidates = Object.entries(link?.candidates ?? {})
+        return (
+          <li key={peer.id} className="diag__row">
+            <span className="diag__name">{peer.persona}</span>
+            <span className={`diag__state diag__state--${link?.connection ?? 'none'}`}>
+              {link?.connection ?? 'no link'}
+            </span>
+            <span className="diag__detail">
+              ice {link?.ice ?? '—'} ·{' '}
+              {link?.negotiated ? 'session agreed' : 'no answer yet'} ·{' '}
+              {link && link.receiving.length > 0 ? link.receiving.join(' + ') : 'no media'}
+              {candidates.length > 0 &&
+                ` · ${candidates.map(([kind, count]) => `${kind}×${count}`).join(' ')}`}
+            </span>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
 export function SettingsPanel() {
   const open = useStore((s) => s.settingsOpen)
   const settings = useStore((s) => s.settings)
   const update = useStore((s) => s.updateSettings)
   const info = useStore((s) => s.info)
   const toggle = useStore((s) => s.toggle)
+  const openLog = useStore((s) => s.openLog)
+  const revealLog = useStore((s) => s.revealLog)
   const [devices, setDevices] = useState<Awaited<ReturnType<typeof listDevices>> | null>(null)
 
   useEffect(() => {
@@ -255,6 +297,24 @@ export function SettingsPanel() {
           Steam carries the call setup, but media negotiates its own path. Two peers both behind
           strict (symmetric) NAT need a relay to reach each other. Leave this empty unless a call
           fails to connect.
+        </p>
+      </section>
+
+      <section className="field">
+        <p className="field__label">Connection</p>
+        <Diagnostics />
+        <div className="field__row">
+          <button className="btn btn--ghost btn--tiny" onClick={() => void openLog()}>
+            Open log file
+          </button>
+          <button className="btn btn--ghost btn--tiny" onClick={() => void revealLog()}>
+            Show in folder
+          </button>
+        </div>
+        <p className="field__hint">
+          The log holds this run only, from all three parts of Hollow: Steam, the background
+          service and this window. It is the fastest way to see where a call that never connected
+          actually stopped.
         </p>
       </section>
 

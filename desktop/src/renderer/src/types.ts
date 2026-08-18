@@ -112,6 +112,11 @@ declare global {
         disconnect(): Promise<void>
         onPcm(handler: (chunk: ArrayBuffer) => void): () => void
       }
+      log: {
+        write(line: string): void
+        open(): Promise<void>
+        reveal(): Promise<void>
+      }
       window: {
         minimize(): Promise<void>
         maximize(): Promise<void>

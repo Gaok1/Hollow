@@ -1,5 +1,6 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useStore } from '../store'
+import { meterTrack } from '../lib/media'
 import {
   CameraIcon,
   CameraOffIcon,
@@ -20,6 +21,29 @@ interface ControlProps {
   danger?: boolean
   onClick: () => void
   children: ReactNode
+}
+
+/**
+ * Live input level of the local microphone, 0 to 1.
+ *
+ * Worth the analyser: "am I actually being heard" is the question people answer
+ * by asking someone else, and a button that moves answers it on its own. Muted
+ * reads zero rather than unhooking, so the bar sits still instead of vanishing.
+ */
+function useMicLevel(): number {
+  const mic = useStore((s) => s.local.mic)
+  const muted = useStore((s) => s.localPresence.micMuted)
+  const [level, setLevel] = useState(0)
+
+  useEffect(() => {
+    if (!mic || muted) {
+      setLevel(0)
+      return
+    }
+    return meterTrack(mic, setLevel)
+  }, [mic, muted])
+
+  return level
 }
 
 function Control({ label, active, danger, onClick, children }: ControlProps) {
@@ -48,6 +72,7 @@ export function ControlBar() {
   const toggle = useStore((s) => s.toggle)
   const mixerOpen = useStore((s) => s.mixerOpen)
   const settingsOpen = useStore((s) => s.settingsOpen)
+  const micLevel = useMicLevel()
 
   if (!room) return null
 
@@ -60,6 +85,15 @@ export function ControlBar() {
           onClick={toggleMic}
         >
           {localPresence.micMuted ? <MicOffIcon /> : <MicIcon />}
+          {!localPresence.micMuted && (
+            <span
+              className="control__level"
+              // Scaled up a little: normal speech sits well below full scale,
+              // and a bar that never moves is worse than no bar.
+              style={{ transform: `scaleX(${Math.min(1, micLevel * 1.6)})` }}
+              aria-hidden
+            />
+          )}
         </Control>
 
         <Control
