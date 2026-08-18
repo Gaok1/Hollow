@@ -183,6 +183,25 @@ impl App {
                 Ok(Value::Null)
             }
 
+            // Chat lives entirely in memory, here and in the UI: nothing is
+            // written to disk on either side, and leaving the room drops it.
+            "chat.send" => {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("chat.send needs an id"))?;
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("chat.send needs text"))?
+                    .to_string();
+                if text.is_empty() {
+                    return Err(anyhow!("chat.send needs a non-empty message"));
+                }
+                self.steam.send(SteamCommand::Chat { id, text });
+                Ok(Value::Null)
+            }
+
             "presence.set" => {
                 self.presence = serde_json::from_value(params)?;
                 self.steam
@@ -364,7 +383,35 @@ impl App {
                 // Presence arrives pre-parsed as PresenceChanged; anything else
                 // on the control channel is not ours.
                 Channel::Control => {}
+                // Chat arrives pre-parsed as ChatReceived, for the same reason.
+                Channel::Chat => {}
             },
+
+            SteamEvent::ChatReceived { from, text } => {
+                self.sink
+                    .emit(
+                        "chat",
+                        json!({ "from": from.to_string(), "text": text }),
+                    )
+                    .await;
+            }
+
+            SteamEvent::ChatDelivered {
+                id,
+                recipients,
+                failed,
+            } => {
+                self.sink
+                    .emit(
+                        "chat.delivery",
+                        json!({
+                            "id": id,
+                            "recipients": recipients,
+                            "failed": failed.iter().map(SteamId::to_string).collect::<Vec<_>>(),
+                        }),
+                    )
+                    .await;
+            }
 
             SteamEvent::Error(message) => {
                 self.sink.emit_error(message).await;

@@ -126,6 +126,15 @@ impl SteamBackend for MockBackend {
                     "invites need the real Steam backend (build with --features steam)".into(),
                 ));
             }
+            // No transport, but the sender still has to learn what happened,
+            // and "delivered to nobody" is the honest answer here.
+            SteamCommand::Chat { id, .. } => {
+                let _ = self.tx.send(SteamEvent::ChatDelivered {
+                    id,
+                    recipients: 0,
+                    failed: Vec::new(),
+                });
+            }
             // No transport: nothing to send to, nothing to hear back.
             SteamCommand::SetPresence(_)
             | SteamCommand::Send { .. }

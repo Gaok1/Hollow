@@ -4,6 +4,7 @@ import { meterTrack } from '../lib/media'
 import {
   CameraIcon,
   CameraOffIcon,
+  ChatIcon,
   LeaveIcon,
   MicIcon,
   MicOffIcon,
@@ -72,6 +73,8 @@ export function ControlBar() {
   const toggle = useStore((s) => s.toggle)
   const mixerOpen = useStore((s) => s.mixerOpen)
   const settingsOpen = useStore((s) => s.settingsOpen)
+  const chatOpen = useStore((s) => s.chatOpen)
+  const chatUnread = useStore((s) => s.chatUnread)
   const micLevel = useMicLevel()
 
   if (!room) return null
@@ -122,6 +125,16 @@ export function ControlBar() {
       </div>
 
       <div className="controlbar__group">
+        <Control
+          label={chatUnread > 0 ? `Chat (${chatUnread} unread)` : 'Chat'}
+          active={chatOpen}
+          onClick={() => toggle('chat')}
+        >
+          <ChatIcon />
+          {chatUnread > 0 && (
+            <span className="control__badge">{chatUnread > 9 ? '9+' : chatUnread}</span>
+          )}
+        </Control>
         <Control label="Audio mixer" active={mixerOpen} onClick={() => toggle('mixer')}>
           <MixerIcon />
         </Control>

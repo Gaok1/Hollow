@@ -21,7 +21,7 @@ use steamworks::{
 
 use crate::avatar::rgba_to_data_url;
 use crate::backend::{BackendKind, SteamBackend, SteamCommand, SteamEvent};
-use crate::types::{Channel, Peer, PersonaState, Presence, Room, SteamId};
+use crate::types::{ChatWire, Channel, Peer, PersonaState, Presence, Room, SteamId};
 
 /// Valve's public test app. Real friends, lobbies and P2P all work against it,
 /// which makes it the right default until Hollow ships under its own App ID.
@@ -403,6 +403,19 @@ impl SteamRealBackend {
             }
             let payload = msg.data().to_vec();
 
+            if channel == Channel::Chat {
+                match serde_json::from_slice::<ChatWire>(&payload) {
+                    Ok(wire) => out.push(SteamEvent::ChatReceived {
+                        from: SteamId(raw),
+                        text: wire.text,
+                    }),
+                    Err(err) => out.push(SteamEvent::Diagnostic(format!(
+                        "chat: unreadable message from {raw} — {err}"
+                    ))),
+                }
+                continue;
+            }
+
             if channel == Channel::Control {
                 if let Ok(presence) = serde_json::from_slice::<Presence>(&payload) {
                     out.push(SteamEvent::PresenceChanged {
@@ -602,6 +615,37 @@ impl SteamBackend for SteamRealBackend {
                 }
             }
 
+            SteamCommand::Chat { id, text } => {
+                let payload = serde_json::to_vec(&ChatWire { text })?;
+                let targets: Vec<SteamId> = self
+                    .room
+                    .as_ref()
+                    .map(|r| {
+                        r.members
+                            .iter()
+                            .map(|m| m.id)
+                            .filter(|id| *id != self.me.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut failed = Vec::new();
+                for to in &targets {
+                    if let Err(err) = self.send_to(*to, Channel::Chat, &payload) {
+                        let _ = self.tx.send(Internal::Event(SteamEvent::Diagnostic(format!(
+                            "chat: send to {to} failed — {err}"
+                        ))));
+                        failed.push(*to);
+                    }
+                }
+
+                let _ = self.tx.send(Internal::Event(SteamEvent::ChatDelivered {
+                    id,
+                    recipients: targets.len(),
+                    failed,
+                }));
+            }
+
             SteamCommand::Shutdown => {
                 if let Some(room) = self.room.take() {
                     self.client
@@ -684,7 +728,12 @@ impl SteamBackend for SteamRealBackend {
             }
         }
 
-        for channel in [Channel::Signaling, Channel::Control, Channel::Files] {
+        for channel in [
+            Channel::Signaling,
+            Channel::Control,
+            Channel::Files,
+            Channel::Chat,
+        ] {
             self.drain_channel(channel, out);
         }
 

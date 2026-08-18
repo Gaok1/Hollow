@@ -189,6 +189,16 @@ function Diagnostics() {
               {candidates.length > 0 &&
                 ` · ${candidates.map(([kind, count]) => `${kind}×${count}`).join(' ')}`}
             </span>
+            {link && link.connection === 'connected' && (
+              <span className="diag__detail">
+                {link.quality.route} · {link.quality.rttMs} ms ·{' '}
+                {(link.quality.loss * 100).toFixed(1)}% loss · ↑
+                {Math.round(link.quality.outBps / 1000)} ↓
+                {Math.round(link.quality.inBps / 1000)} kbps
+                {link.quality.availableBps > 0 &&
+                  ` · link fits ${Math.round(link.quality.availableBps / 1000)} kbps`}
+              </span>
+            )}
           </li>
         )
       })}
@@ -204,11 +214,20 @@ export function SettingsPanel() {
   const toggle = useStore((s) => s.toggle)
   const openLog = useStore((s) => s.openLog)
   const revealLog = useStore((s) => s.revealLog)
+  const copyReport = useStore((s) => s.copyReport)
   const [devices, setDevices] = useState<Awaited<ReturnType<typeof listDevices>> | null>(null)
+  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
     if (open) void listDevices().then(setDevices)
   }, [open])
+
+  // The confirmation is worth nothing if it stays there.
+  useEffect(() => {
+    if (!copied) return
+    const id = setTimeout(() => setCopied(false), 2500)
+    return () => clearTimeout(id)
+  }, [copied])
 
   if (!open) return null
 
@@ -303,6 +322,12 @@ export function SettingsPanel() {
       <section className="field">
         <p className="field__label">Connection</p>
         <Diagnostics />
+        <button
+          className="btn btn--ghost btn--block"
+          onClick={async () => setCopied(await copyReport())}
+        >
+          {copied ? 'Copied — paste it into the report' : 'Copy a report'}
+        </button>
         <div className="field__row">
           <button className="btn btn--ghost btn--tiny" onClick={() => void openLog()}>
             Open log file
@@ -312,9 +337,9 @@ export function SettingsPanel() {
           </button>
         </div>
         <p className="field__hint">
-          The log holds this run only, from all three parts of Hollow: Steam, the background
-          service and this window. It is the fastest way to see where a call that never connected
-          actually stopped.
+          The report is everything above plus the tail of the log, which covers all three parts of
+          Hollow: Steam, the background service and this window. The log holds this run only, and
+          is the fastest way to see where a call that never connected actually stopped.
         </p>
       </section>
 

@@ -50,6 +50,7 @@ const api = {
   log: {
     write: (line: string): void => ipcRenderer.send('log:write', line),
     open: (): Promise<void> => ipcRenderer.invoke('log:open'),
+    tail: (lines: number): Promise<string> => ipcRenderer.invoke('log:tail', lines),
     reveal: (): Promise<void> => ipcRenderer.invoke('log:reveal'),
   },
 

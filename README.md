@@ -13,6 +13,7 @@ Your Steam account is your identity. Your Steam friends list is your contact lis
 - **Per-application audio mixer** — choose exactly which apps are heard in your broadcast, with live meters and per-app volume
 - **Steam-native** — identity, presence, friends, invites and lobbies all come from Steam; no accounts, no signup
 - **File transfer** — send files to anyone in the call, chunked and flow-controlled
+- **Room chat** — text alongside the call, on Steam's own channel; it lives in memory and is gone when the call ends
 - **Serverless media** — WebRTC peer connections carry audio and video; nothing is stored or relayed by us
 
 ---

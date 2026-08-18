@@ -50,6 +50,32 @@ const CAMERA_BUDGET_BPS = 2_400_000
 const CAMERA_FLOOR_BPS = 200_000
 
 /**
+ * How often every link is sampled.
+ *
+ * The sample is what makes the budgets above a ceiling rather than a guess:
+ * Chromium measures what each path will actually carry, and two seconds is
+ * often enough to follow a link degrading without spending the CPU that a
+ * per-second `getStats` over a full mesh costs.
+ */
+const STATS_INTERVAL_MS = 2_000
+
+/**
+ * Bandwidth held back from video on every link, for the audio slots.
+ *
+ * Voice breaking up because a screen share filled the pipe is the one failure
+ * worth paying headroom to avoid — nobody minds a blurry share, everybody
+ * minds not being understood.
+ */
+const AUDIO_RESERVE_BPS = 320_000
+
+/** Opus ceilings. The microphone is mono speech; screen audio is music. */
+const MIC_BPS = 64_000
+const SCREEN_AUDIO_BPS = 160_000
+
+/** What screen video may take of a link's spare capacity when a camera is also on. */
+const SCREEN_SHARE_WITH_CAMERA = 0.75
+
+/**
  * Signaling rides Steam's P2P messaging, which drops anything sent before the
  * remote side has accepted the session — and it accepts only once it has seen
  * us join the lobby, which is a race it can lose. A dropped offer is a call
@@ -77,6 +103,24 @@ const OFFER_RETRY_SLOW_MS = 5_000
  * causes and different answers. Reporting the whole picture is what lets a
  * stuck call say which half is stuck.
  */
+/** What the link is measurably doing, sampled from `getStats`. */
+export interface LinkQuality {
+  /** Round trip on the pair ICE settled on, in milliseconds. */
+  rttMs: number
+  /** Chromium's own estimate of what this link will carry, in bits per second. */
+  availableBps: number
+  /** Share of our outbound packets the far end reports missing, 0 to 1. */
+  loss: number
+  /** What is actually crossing right now, in bits per second. */
+  outBps: number
+  inBps: number
+  /**
+   * How the media is routed. `relay` means it is going through TURN and paying
+   * for it; `host` means the two peers are on the same network.
+   */
+  route: 'host' | 'srflx' | 'prflx' | 'relay' | 'unknown'
+}
+
 export interface LinkHealth {
   connection: RTCPeerConnectionState
   ice: RTCIceConnectionState
@@ -90,6 +134,7 @@ export interface LinkHealth {
   candidates: Record<string, number>
   /** When the link was opened, so the UI can say how long this has been going on. */
   since: number
+  quality: LinkQuality
 }
 
 export interface MeshEvents {
@@ -115,11 +160,15 @@ interface Link {
   health: LinkHealth
   /** Remote slots currently unmuted, backing `health.receiving`. */
   live: Set<TrackSlot>
+  /** Previous byte counters, for turning running totals into rates. */
+  lastSample: { at: number; bytesSent: number; bytesReceived: number } | null
 }
 
 export class Mesh {
   private links = new Map<string, Link>()
   private local: Partial<Record<TrackSlot, MediaStreamTrack | null>> = {}
+  /** Runs only while there is something to measure. */
+  private statsTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(
     private readonly selfId: string,
@@ -153,6 +202,7 @@ export class Mesh {
       await this.sendOffer(peerId, link)
     }
     this.retuneBitrates()
+    this.startSampling()
   }
 
   disconnect(peerId: string): void {
@@ -164,10 +214,12 @@ export class Mesh {
     this.events.log(`link ${peerId}: closed`)
     for (const { slot } of LAYOUT) this.events.onTrack(peerId, slot, null)
     this.retuneBitrates()
+    if (this.links.size === 0) this.stopSampling()
   }
 
   closeAll(): void {
     for (const peerId of [...this.links.keys()]) this.disconnect(peerId)
+    this.stopSampling()
   }
 
   /**
@@ -216,6 +268,7 @@ export class Mesh {
       link = this.createLink(peerId)
       this.links.set(peerId, link)
       this.events.log(`link ${peerId}: opened by their offer`)
+      this.startSampling()
     }
 
     try {
@@ -226,7 +279,7 @@ export class Mesh {
           link.remoteDescriptionSet = true
           await this.flushCandidates(link)
           const answer = await link.pc.createAnswer()
-          await link.pc.setLocalDescription(answer)
+          await this.setLocalTuned(link, answer)
           this.events.send(peerId, { kind: 'answer', sdp: link.pc.localDescription })
           link.health.negotiated = true
           this.report(peerId, link)
@@ -264,38 +317,108 @@ export class Mesh {
     }
   }
 
-  /** Live sender statistics, for the connection quality indicator. */
-  async stats(peerId: string): Promise<{ rttMs: number; outKbps: number; packetLoss: number }> {
-    const link = this.links.get(peerId)
-    if (!link) return { rttMs: 0, outKbps: 0, packetLoss: 0 }
+  // --- internals -------------------------------------------------------------
 
-    const report = await link.pc.getStats()
-    let rttMs = 0
+  private startSampling(): void {
+    if (this.statsTimer) return
+    this.statsTimer = setInterval(() => void this.sample(), STATS_INTERVAL_MS)
+  }
+
+  private stopSampling(): void {
+    if (!this.statsTimer) return
+    clearInterval(this.statsTimer)
+    this.statsTimer = null
+  }
+
+  /** Measure every link, then spend what was measured. */
+  private async sample(): Promise<void> {
+    await Promise.all(
+      [...this.links.entries()].map(([peerId, link]) => this.sampleLink(peerId, link)),
+    )
+    this.retuneBitrates()
+  }
+
+  private async sampleLink(peerId: string, link: Link): Promise<void> {
+    if (link.pc.connectionState !== 'connected') return
+
+    let report: RTCStatsReport
+    try {
+      report = await link.pc.getStats()
+    } catch {
+      return
+    }
+    // The link can go away while `getStats` is in flight.
+    if (this.links.get(peerId) !== link) return
+
+    const candidates = new Map<string, { candidateType?: string }>()
+    let pair: Record<string, number | string | boolean | undefined> | null = null
     let bytesSent = 0
+    let bytesReceived = 0
     let packetsSent = 0
     let packetsLost = 0
 
     report.forEach((stat) => {
-      if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.currentRoundTripTime) {
-        rttMs = Math.round(stat.currentRoundTripTime * 1000)
-      }
-      if (stat.type === 'outbound-rtp') {
-        bytesSent += stat.bytesSent ?? 0
-        packetsSent += stat.packetsSent ?? 0
-      }
-      if (stat.type === 'remote-inbound-rtp') {
-        packetsLost += stat.packetsLost ?? 0
+      switch (stat.type) {
+        case 'local-candidate':
+        case 'remote-candidate':
+          candidates.set(stat.id, stat)
+          break
+        case 'candidate-pair':
+          // `nominated` is the pair ICE actually chose; without that check a
+          // discarded pair's numbers can win the race.
+          if (stat.state === 'succeeded' && stat.nominated !== false) pair = stat
+          break
+        case 'outbound-rtp':
+          bytesSent += stat.bytesSent ?? 0
+          packetsSent += stat.packetsSent ?? 0
+          break
+        case 'inbound-rtp':
+          bytesReceived += stat.bytesReceived ?? 0
+          break
+        case 'remote-inbound-rtp':
+          // Reported by the far end: what it did not get from us.
+          packetsLost += stat.packetsLost ?? 0
+          break
       }
     })
 
-    return {
-      rttMs,
-      outKbps: Math.round((bytesSent * 8) / 1000),
-      packetLoss: packetsSent > 0 ? packetsLost / packetsSent : 0,
+    const selected = pair as {
+      currentRoundTripTime?: number
+      availableOutgoingBitrate?: number
+      localCandidateId?: string
+      remoteCandidateId?: string
+    } | null
+
+    const localType = selected?.localCandidateId
+      ? candidates.get(selected.localCandidateId)?.candidateType
+      : undefined
+    const remoteType = selected?.remoteCandidateId
+      ? candidates.get(selected.remoteCandidateId)?.candidateType
+      : undefined
+    // Either end relaying means the media is relayed.
+    const route =
+      localType === 'relay' || remoteType === 'relay'
+        ? 'relay'
+        : ((localType ?? 'unknown') as LinkQuality['route'])
+
+    const now = Date.now()
+    const previous = link.lastSample
+    const elapsed = previous ? (now - previous.at) / 1000 : 0
+    const rate = (bytes: number, before: number): number =>
+      elapsed > 0 ? Math.max(0, Math.round(((bytes - before) * 8) / elapsed)) : 0
+
+    link.health.quality = {
+      rttMs: Math.round((selected?.currentRoundTripTime ?? 0) * 1000),
+      availableBps: Math.round(selected?.availableOutgoingBitrate ?? 0),
+      loss: packetsSent > 0 ? Math.min(1, packetsLost / packetsSent) : 0,
+      outBps: previous ? rate(bytesSent, previous.bytesSent) : 0,
+      inBps: previous ? rate(bytesReceived, previous.bytesReceived) : 0,
+      route,
     }
+    link.lastSample = { at: now, bytesSent, bytesReceived }
+    this.report(peerId, link)
   }
 
-  // --- internals -------------------------------------------------------------
 
   private createLink(peerId: string): Link {
     const pc = new RTCPeerConnection({
@@ -317,6 +440,7 @@ export class Mesh {
       remoteDescriptionSet: false,
       offerRetry: null,
       live: new Set(),
+      lastSample: null,
       health: {
         connection: pc.connectionState,
         ice: pc.iceConnectionState,
@@ -325,6 +449,14 @@ export class Mesh {
         unansweredOffers: 0,
         candidates: {},
         since: Date.now(),
+        quality: {
+          rttMs: 0,
+          availableBps: 0,
+          loss: 0,
+          outBps: 0,
+          inBps: 0,
+          route: 'unknown',
+        },
       },
     }
 
@@ -415,13 +547,36 @@ export class Mesh {
 
   /** Hand the current picture of a link to the UI. */
   private report(peerId: string, link: Link): void {
-    this.events.onHealth(peerId, { ...link.health, candidates: { ...link.health.candidates } })
+    this.events.onHealth(peerId, {
+      ...link.health,
+      candidates: { ...link.health.candidates },
+      quality: { ...link.health.quality },
+    })
+  }
+
+  /**
+   * Apply a local description with Opus widened, falling back to the original.
+   *
+   * Munged SDP is only ever an optimisation here, so a Chromium that refuses it
+   * must cost the tuning and not the call.
+   */
+  private async setLocalTuned(link: Link, description: RTCSessionDescriptionInit): Promise<void> {
+    const tuned = tuneOpus(description.sdp)
+    if (tuned !== description.sdp) {
+      try {
+        await link.pc.setLocalDescription({ ...description, sdp: tuned })
+        return
+      } catch (err) {
+        this.events.log(`opus tuning refused, using the plain description — ${err}`)
+      }
+    }
+    await link.pc.setLocalDescription(description)
   }
 
   private async sendOffer(peerId: string, link: Link): Promise<void> {
     try {
       const offer = await link.pc.createOffer()
-      await link.pc.setLocalDescription(offer)
+      await this.setLocalTuned(link, offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
       this.events.log(`link ${peerId}: offer sent`)
       this.scheduleOfferRetry(peerId, link, 1)
@@ -463,7 +618,7 @@ export class Mesh {
     if (!this.isOfferer(peerId)) return
     try {
       const offer = await link.pc.createOffer({ iceRestart: true })
-      await link.pc.setLocalDescription(offer)
+      await this.setLocalTuned(link, offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
       this.events.log(`link ${peerId}: ICE restart offered`)
       this.scheduleOfferRetry(peerId, link, 1)
@@ -505,36 +660,125 @@ export class Mesh {
    */
   private retuneBitrates(): void {
     const viewers = Math.max(1, this.links.size)
-    const screenBps = Math.max(SCREEN_FLOOR_BPS, Math.floor(SCREEN_BUDGET_BPS / viewers))
-    const cameraBps = Math.max(CAMERA_FLOOR_BPS, Math.floor(CAMERA_BUDGET_BPS / viewers))
+    // The uplink is shared across every link, so these stay a hard ceiling.
+    const screenCap = Math.max(SCREEN_FLOOR_BPS, Math.floor(SCREEN_BUDGET_BPS / viewers))
+    const cameraCap = Math.max(CAMERA_FLOOR_BPS, Math.floor(CAMERA_BUDGET_BPS / viewers))
 
-    const screenIndex = LAYOUT.findIndex((e) => e.slot === 'screen')
-    const cameraIndex = LAYOUT.findIndex((e) => e.slot === 'camera')
+    // With nothing to send in the other video slot, one takes the whole link.
+    const sendingScreen = Boolean(this.local.screen)
+    const sendingCamera = Boolean(this.local.camera)
+    const screenShare = sendingCamera ? SCREEN_SHARE_WITH_CAMERA : 1
+    const cameraShare = sendingScreen ? 1 - SCREEN_SHARE_WITH_CAMERA : 1
+
+    const index = (slot: TrackSlot): number => LAYOUT.findIndex((e) => e.slot === slot)
 
     for (const link of this.links.values()) {
-      applyBitrate(link.transceivers[screenIndex]?.sender, screenBps, 'detail')
-      applyBitrate(link.transceivers[cameraIndex]?.sender, cameraBps, 'motion')
+      // Before the first sample there is no estimate, and a ceiling with no
+      // measurement under it is the old behaviour — which is the right thing
+      // to fall back to.
+      const available = link.health.quality.availableBps
+      const spare = available > 0 ? Math.max(0, available - AUDIO_RESERVE_BPS) : Number.POSITIVE_INFINITY
+
+      this.applyEncoding(link, index('screen'), {
+        maxBitrate: Math.max(SCREEN_FLOOR_BPS, Math.min(screenCap, Math.floor(spare * screenShare))),
+        // Text stays legible when the encoder is squeezed; the alternative is
+        // a smooth but unreadable blur.
+        degradation: 'maintain-resolution',
+        priority: 'low',
+      })
+      this.applyEncoding(link, index('camera'), {
+        maxBitrate: Math.max(CAMERA_FLOOR_BPS, Math.min(cameraCap, Math.floor(spare * cameraShare))),
+        degradation: 'maintain-framerate',
+        priority: 'medium',
+      })
+      // Audio is priced separately and cheaply, and marked so the transport
+      // starves video first when the link tightens.
+      this.applyEncoding(link, index('mic'), { maxBitrate: MIC_BPS, priority: 'high' })
+      this.applyEncoding(link, index('screenAudio'), {
+        maxBitrate: SCREEN_AUDIO_BPS,
+        priority: 'medium',
+      })
     }
+  }
+
+  /**
+   * Set one sender's encoding, skipping the call when nothing changed.
+   *
+   * `retuneBitrates` now runs on every sample rather than only on churn, and
+   * `setParameters` is not free — it can interrupt the encoder.
+   */
+  private applyEncoding(
+    link: Link,
+    index: number,
+    wanted: {
+      maxBitrate: number
+      priority: RTCPriorityType
+      degradation?: RTCDegradationPreference
+    },
+  ): void {
+    const sender = link.transceivers[index]?.sender
+    if (!sender) return
+
+    const params = sender.getParameters()
+    if (!params.encodings || params.encodings.length === 0) {
+      // Chromium populates this lazily; skipping now is fine because the next
+      // retune will find it.
+      params.encodings = [{}]
+    }
+    const encoding = params.encodings[0]
+
+    const unchanged =
+      encoding.maxBitrate === wanted.maxBitrate &&
+      encoding.networkPriority === wanted.priority &&
+      (wanted.degradation === undefined || params.degradationPreference === wanted.degradation)
+    if (unchanged) return
+
+    encoding.maxBitrate = wanted.maxBitrate
+    encoding.priority = wanted.priority
+    encoding.networkPriority = wanted.priority
+    if (wanted.degradation) params.degradationPreference = wanted.degradation
+
+    sender.setParameters(params).catch((err) => this.events.log(`setParameters failed — ${err}`))
   }
 }
 
 /**
- * @param hint `detail` keeps text legible by dropping frames under pressure;
- * `motion` does the opposite. Screen shares are usually read, not watched.
+ * Widen Opus on the way out.
+ *
+ * Chromium negotiates it conservatively — mono, no in-band FEC, an average
+ * bitrate sized for speech — which is right for a phone call and wrong for
+ * sharing a game's audio. In-band FEC also conceals a lost packet instead of
+ * letting it be heard, which is the cheapest quality win voice has.
+ *
+ * One fmtp line covers both audio streams because a bundled session gives them
+ * the same payload type, and that is fine: `maxaveragebitrate` is a ceiling,
+ * and each sender's own `maxBitrate` is what actually holds it down.
  */
-function applyBitrate(
-  sender: RTCRtpSender | undefined,
-  maxBitrate: number,
-  hint: 'detail' | 'motion',
-): void {
-  if (!sender) return
-  const params = sender.getParameters()
-  if (!params.encodings || params.encodings.length === 0) {
-    // Chromium populates this lazily; skipping now is fine because the next
-    // retune will find it.
-    params.encodings = [{}]
+function tuneOpus(sdp: string | undefined): string | undefined {
+  if (!sdp) return sdp
+  const payload = /^a=rtpmap:(\d+) opus\/48000\/2/im.exec(sdp)?.[1]
+  if (!payload) return sdp
+
+  const fmtp = new RegExp(`^a=fmtp:${payload} (.*)$`, 'im')
+  const existing = fmtp.exec(sdp)
+
+  const params = new Map<string, string>()
+  for (const pair of existing?.[1].split(';') ?? []) {
+    const [key, value] = pair.split('=')
+    if (key?.trim()) params.set(key.trim(), (value ?? '').trim())
   }
-  params.encodings[0].maxBitrate = maxBitrate
-  params.degradationPreference = hint === 'detail' ? 'maintain-resolution' : 'maintain-framerate'
-  sender.setParameters(params).catch((err) => console.warn('setParameters failed', err))
+  params.set('stereo', '1')
+  params.set('sprop-stereo', '1')
+  params.set('useinbandfec', '1')
+  params.set('maxaveragebitrate', String(SCREEN_AUDIO_BPS))
+
+  const line = `a=fmtp:${payload} ${[...params]
+    .map(([key, value]) => `${key}=${value}`)
+    .join(';')}`
+
+  if (existing) return sdp.replace(fmtp, line)
+  return sdp.replace(
+    new RegExp(`^(a=rtpmap:${payload} opus/48000/2)$`, 'im'),
+    `$1\r\n${line}`,
+  )
 }

@@ -124,6 +124,18 @@ export const MaximizeIcon = ({ size = 14, className }: IconProps) => (
   </svg>
 )
 
+export const ChatIcon = ({ size = 20, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-7a8 8 0 0 1 8-8h2a8 8 0 0 1 8 4z" />
+  </svg>
+)
+
+export const SendIcon = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M4 12 20 4l-8 16-2-6z" />
+  </svg>
+)
+
 export const AlertIcon = ({ size = 14, className }: IconProps) => (
   <svg {...base(size)} className={className}>
     <path d="M12 3.5 22 20H2z" />

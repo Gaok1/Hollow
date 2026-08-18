@@ -115,6 +115,7 @@ declare global {
       log: {
         write(line: string): void
         open(): Promise<void>
+        tail(lines: number): Promise<string>
         reveal(): Promise<void>
       }
       window: {

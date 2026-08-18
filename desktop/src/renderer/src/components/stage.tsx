@@ -53,8 +53,15 @@ function RemoteAudio({ track, muted }: { track: MediaStreamTrack | undefined; mu
 function tileStatus(health: LinkHealth | undefined): string | null {
   if (!health) return 'Connecting'
   switch (health.connection) {
-    case 'connected':
+    case 'connected': {
+      // Connected is not the same as working. Loss is what is actually heard
+      // as choppy audio, and latency is what is felt as people talking over
+      // each other, so both are worth a word before anyone blames the app.
+      const { loss, rttMs } = health.quality
+      if (loss > 0.05) return `Losing ${Math.round(loss * 100)}%`
+      if (rttMs > 300) return `${rttMs} ms delay`
       return null
+    }
     case 'failed':
       return 'Reconnecting'
     case 'disconnected':

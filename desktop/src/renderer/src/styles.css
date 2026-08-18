@@ -877,6 +877,25 @@ select {
   transition: transform 90ms linear;
 }
 
+/* Inside the button's bounds, because .control clips to make room for the
+   level bar. */
+.control__badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #04120d;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .control--danger {
   background: var(--danger-dim);
   border-color: rgba(255, 77, 106, 0.3);
@@ -1194,6 +1213,172 @@ select {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 60%;
+}
+
+/* --- chat ----------------------------------------------------------------- */
+
+/*
+ * The panel scrolls in one place — the message list — so the composer stays
+ * where the hands are and the header stays readable.
+ */
+.panel--chat {
+  overflow: hidden;
+  gap: 10px;
+}
+
+.chat__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+
+.chat__empty {
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 8px 2px;
+}
+
+.chat__line {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+/* Only the first message of a turn carries the avatar and the name; the rest
+   line up under it. */
+.chat__line--opens {
+  margin-top: 10px;
+}
+
+.chat__line--opens:first-child {
+  margin-top: 0;
+}
+
+.chat__gutter {
+  width: 28px;
+}
+
+.chat__body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat__meta {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.chat__author {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__you {
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.chat__time {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.chat__text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  /* Pasted links and long words must wrap rather than widen the panel. */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat__pending {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.chat__failed {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.chat__failed--partial {
+  color: var(--warn);
+}
+
+.chat__compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.chat__compose:focus-within {
+  border-color: var(--accent-line);
+}
+
+.chat__compose textarea {
+  flex: 1;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  resize: none;
+  outline: none;
+  max-height: 120px;
+}
+
+.chat__compose textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.chat__send:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.chat__send:disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
 }
 
 /* --- modal ---------------------------------------------------------------- */

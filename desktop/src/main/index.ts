@@ -1,4 +1,4 @@
-import { appendFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BrowserWindow, app, desktopCapturer, ipcMain, session, shell } from 'electron'
 import { Sidecar } from './sidecar'
@@ -223,6 +223,22 @@ ipcMain.handle('audio:disconnect', () => audioPipe.stop())
  * not cost a promise per line.
  */
 ipcMain.on('log:write', (_e, line: string) => log('ui', line))
+
+/**
+ * The tail of the log, for the report Settings puts on the clipboard.
+ *
+ * Reading it back rather than keeping a second copy in the renderer means the
+ * report carries the daemon's lines too, which are the ones that explain a
+ * Steam problem.
+ */
+ipcMain.handle('log:tail', (_e, lines: number) => {
+  try {
+    const all = readFileSync(logPath, 'utf8').split('\n')
+    return all.slice(Math.max(0, all.length - lines)).join('\n')
+  } catch {
+    return ''
+  }
+})
 
 /** Open the log in whatever the OS uses for text files. */
 ipcMain.handle('log:open', () => shell.openPath(logPath))

@@ -143,6 +143,15 @@ pub struct Room {
     pub max_members: u32,
 }
 
+/// One chat message on the wire.
+///
+/// A struct rather than a bare string so a later field — a reply target, an
+/// attachment id — does not need a new channel and a version check.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatWire {
+    pub text: String,
+}
+
 /// Logical channels multiplexed over Steam's peer-to-peer messaging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
@@ -153,6 +162,13 @@ pub enum Channel {
     Control = 1,
     /// File transfer framing. Reliable.
     Files = 2,
+    /// Room chat. Reliable and ordered, which is all a chat needs.
+    ///
+    /// Separate from `Control` rather than another shape on it: control
+    /// payloads are identified by parsing them as presence and falling back,
+    /// and adding a second shape to that guess is how a chat message ends up
+    /// interpreted as a mute.
+    Chat = 3,
 }
 
 impl Channel {
@@ -161,6 +177,7 @@ impl Channel {
             0 => Some(Channel::Signaling),
             1 => Some(Channel::Control),
             2 => Some(Channel::Files),
+            3 => Some(Channel::Chat),
             _ => None,
         }
     }

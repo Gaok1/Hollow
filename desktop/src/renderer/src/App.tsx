@@ -5,6 +5,7 @@ import { Sidebar } from './components/sidebar'
 import { Stage } from './components/stage'
 import { ControlBar, ScreenPicker } from './components/controls'
 import { MixerPanel, SettingsPanel } from './components/panels'
+import { ChatPanel } from './components/chat'
 import { Transfers, useFileDrop } from './components/transfers'
 
 export default function App() {
@@ -12,6 +13,7 @@ export default function App() {
   const fatal = useStore((s) => s.fatal)
   const mixerOpen = useStore((s) => s.mixerOpen)
   const settingsOpen = useStore((s) => s.settingsOpen)
+  const chatOpen = useStore((s) => s.chatOpen)
   const { dragging, handlers } = useFileDrop()
 
   useEffect(() => {
@@ -25,7 +27,9 @@ export default function App() {
       {fatal ? (
         <FatalError message={fatal} />
       ) : (
-        <div className={`layout ${mixerOpen || settingsOpen ? 'layout--panelled' : ''}`}>
+        <div
+          className={`layout ${mixerOpen || settingsOpen || chatOpen ? 'layout--panelled' : ''}`}
+        >
           <Sidebar />
           <main className="main" {...handlers}>
             <Stage />
@@ -35,6 +39,7 @@ export default function App() {
           </main>
           <MixerPanel />
           <SettingsPanel />
+          <ChatPanel />
         </div>
       )}
 

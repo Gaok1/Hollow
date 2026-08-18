@@ -32,6 +32,25 @@ const rpc = <T = unknown,>(method: string, params?: unknown): Promise<T> =>
  */
 const log = (line: string): void => window.hollow.log.write(line)
 
+/**
+ * One line of room chat.
+ *
+ * Chat is deliberately memory-only: nothing is written to disk at either end,
+ * and leaving the room drops the history. A call is a conversation, not a
+ * record of one, and a log nobody asked for is a liability.
+ */
+export interface ChatMessage {
+  id: number
+  /** SteamID64 of the author. */
+  from: string
+  persona: string
+  text: string
+  at: number
+  mine: boolean
+  /** Only on our own messages: what Steam did with it. */
+  delivery?: 'sending' | 'sent' | 'partial' | 'failed'
+}
+
 export interface Toast {
   id: number
   kind: 'info' | 'error' | 'invite'
@@ -96,6 +115,9 @@ interface State {
   presence: Record<string, Presence>
   /** What each link is doing, keyed by SteamID64. Drives every status the UI shows. */
   health: Record<string, LinkHealth>
+  chat: ChatMessage[]
+  /** Messages that arrived while the panel was closed. */
+  chatUnread: number
   remoteTracks: Record<string, Partial<Record<TrackSlot, MediaStreamTrack>>>
 
   local: Partial<Record<TrackSlot, MediaStreamTrack>>
@@ -111,6 +133,7 @@ interface State {
   pickerOpen: boolean
   settingsOpen: boolean
   mixerOpen: boolean
+  chatOpen: boolean
   settings: Settings
   transfers: FileTransfer[]
   toasts: Toast[]
@@ -135,12 +158,15 @@ interface State {
   setSessionVolume(pid: number, volume: number, muted: boolean): Promise<void>
   setMasterGain(gain: number): Promise<void>
 
+  sendChat(text: string): Promise<void>
   refreshFriends(): Promise<void>
   openLog(): Promise<void>
+  /** Put a shareable diagnostic report on the clipboard. */
+  copyReport(): Promise<boolean>
   revealLog(): Promise<void>
   updateSettings(patch: Partial<Settings>): void
   setPinned(peerId: string | null): void
-  toggle(panel: 'settings' | 'mixer'): void
+  toggle(panel: 'settings' | 'mixer' | 'chat'): void
   dismissToast(id: number): void
   acceptInvite(toast: Toast): Promise<void>
   sendFiles(to: string, paths: string[]): Promise<void>
@@ -149,6 +175,8 @@ interface State {
 }
 
 let toastSeq = 1
+/** Shared by sent and received messages so React keys never collide. */
+let chatSeq = 1
 
 export const useStore = create<State>((set, get) => ({
   info: null,
@@ -157,6 +185,8 @@ export const useStore = create<State>((set, get) => ({
   room: null,
   presence: {},
   health: {},
+  chat: [],
+  chatUnread: 0,
   remoteTracks: {},
   local: {},
   localPresence: {
@@ -173,6 +203,7 @@ export const useStore = create<State>((set, get) => ({
   pickerOpen: false,
   settingsOpen: false,
   mixerOpen: false,
+  chatOpen: false,
   settings: loadSettings(),
   transfers: [],
   toasts: [],
@@ -225,7 +256,16 @@ export const useStore = create<State>((set, get) => ({
       if (!room) {
         log('room: left')
         mesh?.closeAll()
-        set({ remoteTracks: {}, health: {}, presence: {}, pinned: null })
+        // Chat dies with the room. That is the whole contract.
+        set({
+          remoteTracks: {},
+          health: {},
+          presence: {},
+          pinned: null,
+          chat: [],
+          chatUnread: 0,
+          chatOpen: false,
+        })
         void get().stopShare()
         return
       }
@@ -305,6 +345,49 @@ export const useStore = create<State>((set, get) => ({
         case 'signal': {
           const { from, payload: signalPayload } = data as { from: string; payload: unknown }
           void mesh?.handleSignal(from, signalPayload)
+          break
+        }
+
+        case 'chat': {
+          const { from, text } = data as { from: string; text: string }
+          const author =
+            get().room?.members.find((m) => m.id === from) ??
+            get().friends.find((f) => f.id === from)
+          set((s) => ({
+            chat: [
+              ...s.chat,
+              {
+                id: chatSeq++,
+                from,
+                persona: author?.persona ?? `User ${from}`,
+                text,
+                at: Date.now(),
+                mine: false,
+              },
+            ],
+            chatUnread: s.chatOpen ? s.chatUnread : s.chatUnread + 1,
+          }))
+          break
+        }
+
+        case 'chat.delivery': {
+          const { id, recipients, failed } = data as {
+            id: number
+            recipients: number
+            failed: string[]
+          }
+          if (failed.length > 0) {
+            log(`chat ${id}: ${failed.length} of ${recipients} recipient(s) refused`)
+          }
+          const delivery: ChatMessage['delivery'] =
+            failed.length === 0
+              ? 'sent'
+              : failed.length >= recipients
+                ? 'failed'
+                : 'partial'
+          set((s) => ({
+            chat: s.chat.map((m) => (m.id === id ? { ...m, delivery } : m)),
+          }))
           break
         }
 
@@ -403,6 +486,40 @@ export const useStore = create<State>((set, get) => ({
     await get().refreshFriends()
   },
 
+  async sendChat(text) {
+    const trimmed = text.trim()
+    if (!trimmed) return
+
+    const me = get().me
+    const id = chatSeq++
+    // Shown before it is sent, and corrected when the daemon reports back:
+    // a chat that waits for a round trip to echo feels broken even when it
+    // is working.
+    set((s) => ({
+      chat: [
+        ...s.chat,
+        {
+          id,
+          from: me?.id ?? '',
+          persona: me?.persona ?? 'You',
+          text: trimmed,
+          at: Date.now(),
+          mine: true,
+          delivery: 'sending',
+        },
+      ],
+    }))
+
+    try {
+      await rpc('chat.send', { id, text: trimmed })
+    } catch (err) {
+      log(`chat.send failed — ${err}`)
+      set((s) => ({
+        chat: s.chat.map((m) => (m.id === id ? { ...m, delivery: 'failed' } : m)),
+      }))
+    }
+  },
+
   async refreshFriends() {
     await rpc('friends.refresh').catch((err) => log(`friends.refresh failed — ${err}`))
   },
@@ -413,6 +530,60 @@ export const useStore = create<State>((set, get) => ({
 
   async revealLog() {
     await window.hollow.log.reveal()
+  },
+
+  /**
+   * Everything worth pasting into a bug report, in one go.
+   *
+   * The point is that a report is complete without anyone knowing what to
+   * include: build, backend, what every link settled on, and the tail of the
+   * log from all three processes.
+   */
+  async copyReport() {
+    const { info, room, me, health } = get()
+    const lines: string[] = [
+      `Hollow ${info?.version ?? '?'} — ${info?.backend ?? '?'} backend, app id ${info?.appId ?? '?'}`,
+      `Windows build ${info?.capabilities.windowsBuild ?? '?'}, per-process capture ${
+        info?.capabilities.perProcessCapture ? 'yes' : 'no'
+      }`,
+      `Room: ${room ? `${room.name} (${room.members.length}/${room.maxMembers})` : 'none'}`,
+      '',
+      'Links:',
+    ]
+
+    const peers = (room?.members ?? []).filter((m) => m.id !== me?.id)
+    if (peers.length === 0) lines.push('  (nobody else in the room)')
+    for (const peer of peers) {
+      const link = health[peer.id]
+      if (!link) {
+        lines.push(`  ${peer.persona}: no link`)
+        continue
+      }
+      const candidates = Object.entries(link.candidates)
+        .map(([kind, count]) => `${kind}x${count}`)
+        .join(' ')
+      lines.push(
+        `  ${peer.persona}: ${link.connection}/${link.ice}, ` +
+          `${link.negotiated ? 'negotiated' : 'NOT negotiated'}, ` +
+          `receiving [${link.receiving.join(' ') || 'nothing'}], ` +
+          `route ${link.quality.route}, rtt ${link.quality.rttMs}ms, ` +
+          `loss ${(link.quality.loss * 100).toFixed(1)}%, ` +
+          `up ${Math.round(link.quality.outBps / 1000)}kbps down ${Math.round(
+            link.quality.inBps / 1000,
+          )}kbps, avail ${Math.round(link.quality.availableBps / 1000)}kbps, ` +
+          `offers unanswered ${link.unansweredOffers}, candidates ${candidates || 'none'}`,
+      )
+    }
+
+    lines.push('', 'Log:', await window.hollow.log.tail(200))
+
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'))
+      return true
+    } catch (err) {
+      log(`could not write the report to the clipboard — ${err}`)
+      return false
+    }
   },
 
   async createRoom(name) {
@@ -647,8 +818,18 @@ export const useStore = create<State>((set, get) => ({
   },
 
   toggle(panel) {
-    if (panel === 'settings') set((s) => ({ settingsOpen: !s.settingsOpen, mixerOpen: false }))
-    else set((s) => ({ mixerOpen: !s.mixerOpen, settingsOpen: false }))
+    // One panel at a time: the layout has a single column for them, and two
+    // open at once would just push the stage out of the window.
+    set((s) => {
+      const open = !s[`${panel}Open` as const]
+      return {
+        settingsOpen: panel === 'settings' && open,
+        mixerOpen: panel === 'mixer' && open,
+        chatOpen: panel === 'chat' && open,
+        // Opening it is reading it.
+        chatUnread: panel === 'chat' && open ? 0 : s.chatUnread,
+      }
+    })
   },
 
   dismissToast(id) {

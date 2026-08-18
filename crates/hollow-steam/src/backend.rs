@@ -30,6 +30,12 @@ pub enum SteamCommand {
     },
     /// Deliver an application payload to every other member of the room.
     Broadcast { channel: Channel, payload: Vec<u8> },
+    /// Send one chat message to the room.
+    ///
+    /// Distinct from `Broadcast` because the sender is told what happened to
+    /// it: a message that reached nobody has to be able to say so, and a
+    /// fire-and-forget broadcast cannot.
+    Chat { id: u64, text: String },
     Shutdown,
 }
 
@@ -54,6 +60,15 @@ pub enum SteamEvent {
         from: SteamId,
         channel: Channel,
         payload: Vec<u8>,
+    },
+    /// A chat message arrived from a peer.
+    ChatReceived { from: SteamId, text: String },
+    /// What became of a chat message we sent. `failed` lists the peers Steam
+    /// would not take it for; `recipients` is how many it was meant for.
+    ChatDelivered {
+        id: u64,
+        recipients: usize,
+        failed: Vec<SteamId>,
     },
     /// Non-fatal problem worth surfacing in the UI.
     Error(String),
