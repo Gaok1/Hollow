@@ -25,13 +25,17 @@ interface ControlProps {
 }
 
 /**
- * Live input level of the local microphone, 0 to 1.
+ * Live input level of the local microphone, after the boost, 0 to 1.
  *
  * Worth the analyser: "am I actually being heard" is the question people answer
  * by asking someone else, and a button that moves answers it on its own. Muted
  * reads zero rather than unhooking, so the bar sits still instead of vanishing.
+ *
+ * It reads the track being sent rather than the device, which is what makes it
+ * the meter to watch while dragging the boost: it shows what the other end
+ * gets, not what the microphone happened to pick up.
  */
-function useMicLevel(): number {
+export function useMicLevel(): number {
   const mic = useStore((s) => s.local.mic)
   const muted = useStore((s) => s.localPresence.micMuted)
   const [level, setLevel] = useState(0)

@@ -1,10 +1,33 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+} from 'react'
 import { useStore } from '../store'
-import { meterTrack } from '../lib/media'
+import {
+  MIC_BOOST_MAX,
+  MIC_BOOST_MIN,
+  PEER_VOLUME_MAX,
+  meterTrack,
+  playRemoteTrack,
+  type AudioSink,
+} from '../lib/media'
 import type { LinkHealth } from '../lib/mesh'
 import type { Peer, TrackSlot } from '../types'
 import { Avatar } from './sidebar'
-import { AlertIcon, MicOffIcon, PinIcon, ScreenIcon, SpeakerIcon } from './icons'
+import {
+  AlertIcon,
+  MicIcon,
+  MicOffIcon,
+  PinIcon,
+  ScreenIcon,
+  SpeakerIcon,
+  SpeakerOffIcon,
+} from './icons'
 
 /**
  * How long a link may sit unconnected before Hollow stops saying "connecting"
@@ -33,12 +56,36 @@ function useTrack<T extends HTMLMediaElement>(track: MediaStreamTrack | undefine
   return ref
 }
 
-/** Remote audio never has a visible element, but it does have to be played. */
-function RemoteAudio({ track, muted }: { track: MediaStreamTrack | undefined; muted: boolean }) {
-  const ref = useTrack<HTMLAudioElement>(track)
+/**
+ * Remote audio never has a visible element, but it does have to be played — at
+ * whatever volume this end has decided this person needs.
+ *
+ * The element stays in the tree because the sink still needs it; what it does
+ * not do any more is set the volume, since it cannot go above 100%.
+ */
+function RemoteAudio({ track, volume }: { track: MediaStreamTrack | undefined; volume: number }) {
+  const ref = useRef<HTMLAudioElement>(null)
+  const sink = useRef<AudioSink | null>(null)
+  // Read by the attach effect, which must not re-run when only the volume moves.
+  const wanted = useRef(volume)
+  wanted.current = volume
+
   useEffect(() => {
-    if (ref.current) ref.current.muted = muted
-  }, [muted, ref])
+    const element = ref.current
+    if (!element || !track) return
+    const attached = playRemoteTrack(track, element)
+    attached.setVolume(wanted.current)
+    sink.current = attached
+    return () => {
+      sink.current = null
+      attached.close()
+    }
+  }, [track])
+
+  useEffect(() => {
+    sink.current?.setVolume(volume)
+  }, [volume])
+
   return <audio ref={ref} autoPlay />
 }
 
@@ -166,6 +213,165 @@ function useSpeaking(track: MediaStreamTrack | undefined): boolean {
   return level > 0.08
 }
 
+interface MenuAt {
+  peerId: string
+  x: number
+  y: number
+}
+
+/**
+ * The right-click menu on a tile.
+ *
+ * Volume belongs on the person, not in a settings page: the question is always
+ * "this one is too quiet", and the fastest way to say which one is to point at
+ * them. Right-clicking a participant is where every other voice app has put
+ * this, so it is also where people will look for it.
+ *
+ * Your own tile gets the microphone boost instead, because you have no incoming
+ * audio to turn up — the thing that needs adjusting is what everyone else is
+ * hearing.
+ */
+function PeerMenu({ peerId, x, y, onClose }: MenuAt & { onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const me = useStore((s) => s.me)
+  const room = useStore((s) => s.room)
+  const settings = useStore((s) => s.settings)
+  const muted = useStore((s) => s.peerMuted[peerId] ?? false)
+  const pinned = useStore((s) => s.pinned)
+  const setPeerVolume = useStore((s) => s.setPeerVolume)
+  const togglePeerMuted = useStore((s) => s.togglePeerMuted)
+  const setMicBoost = useStore((s) => s.setMicBoost)
+  const setPinned = useStore((s) => s.setPinned)
+  const toggle = useStore((s) => s.toggle)
+  const [at, setAt] = useState({ left: x, top: y })
+
+  // Opened at the pointer, then pulled back inside the window. A menu that
+  // spills off the bottom edge is a menu whose last item cannot be clicked.
+  useLayoutEffect(() => {
+    const box = ref.current?.getBoundingClientRect()
+    if (!box) return
+    const pad = 8
+    setAt({
+      left: Math.max(pad, Math.min(x, window.innerWidth - box.width - pad)),
+      top: Math.max(pad, Math.min(y, window.innerHeight - box.height - pad)),
+    })
+  }, [x, y])
+
+  useEffect(() => {
+    const onDown = (event: PointerEvent) => {
+      if (!ref.current?.contains(event.target as Node)) onClose()
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    // Capture, so a click that lands on a button elsewhere still closes this.
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('blur', onClose)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('blur', onClose)
+    }
+  }, [onClose])
+
+  const peer = room?.members.find((m) => m.id === peerId)
+  // They left while the menu was open. Nothing left to adjust.
+  if (!peer) return null
+
+  const isSelf = peer.id === me?.id
+  const volume = settings.peerVolume[peer.id] ?? 1
+
+  return (
+    <div className="menu" ref={ref} style={at} role="menu">
+      <div className="menu__head">
+        <Avatar peer={peer} size={22} />
+        <span className="menu__name">{isSelf ? 'Your microphone' : peer.persona}</span>
+      </div>
+
+      {isSelf ? (
+        <>
+          <div className="menu__row">
+            <MicIcon size={14} />
+            <input
+              className="slider"
+              type="range"
+              min={MIC_BOOST_MIN}
+              max={MIC_BOOST_MAX}
+              step={0.05}
+              value={settings.micBoost}
+              onChange={(e) => setMicBoost(Number(e.target.value))}
+            />
+            <span className="menu__value">{Math.round(settings.micBoost * 100)}%</span>
+          </div>
+          <p className="menu__hint">
+            Changes what everyone else hears, not what you do. A limiter catches the peaks, so
+            pushing this will not turn your voice into crackle.
+          </p>
+          {settings.micBoost !== 1 && (
+            <button className="menu__item" onClick={() => setMicBoost(1)}>
+              Reset to 100%
+            </button>
+          )}
+          <button
+            className="menu__item"
+            onClick={() => {
+              toggle('settings')
+              onClose()
+            }}
+          >
+            Open settings
+          </button>
+        </>
+      ) : (
+        <>
+          <div className="menu__row">
+            <button
+              className="iconbtn"
+              onClick={() => togglePeerMuted(peer.id)}
+              aria-label={muted ? 'Unmute for me' : 'Mute for me'}
+            >
+              {muted ? <SpeakerOffIcon size={14} /> : <SpeakerIcon size={14} />}
+            </button>
+            <input
+              className="slider"
+              type="range"
+              min={0}
+              max={PEER_VOLUME_MAX}
+              step={0.05}
+              value={volume}
+              disabled={muted}
+              onChange={(e) => setPeerVolume(peer.id, Number(e.target.value))}
+            />
+            <span className="menu__value">{Math.round(volume * 100)}%</span>
+          </div>
+          <p className="menu__hint">
+            Only you hear the difference. Nothing is sent, and {peer.persona} is not told.
+          </p>
+          <button className="menu__item" onClick={() => togglePeerMuted(peer.id)}>
+            {muted ? `Unmute ${peer.persona} for me` : `Mute ${peer.persona} for me`}
+          </button>
+          {volume !== 1 && (
+            <button className="menu__item" onClick={() => setPeerVolume(peer.id, 1)}>
+              Reset to 100%
+            </button>
+          )}
+        </>
+      )}
+
+      <button
+        className="menu__item"
+        onClick={() => {
+          setPinned(pinned === peer.id ? null : peer.id)
+          onClose()
+        }}
+      >
+        {pinned === peer.id ? 'Unpin from the stage' : 'Pin to the stage'}
+      </button>
+    </div>
+  )
+}
+
 interface TileProps {
   peer: Peer
   video?: MediaStreamTrack
@@ -177,6 +383,7 @@ interface TileProps {
   isSelf: boolean
   compact?: boolean
   onPin?: () => void
+  onMenu?: (event: MouseEvent) => void
 }
 
 function Tile({
@@ -189,6 +396,7 @@ function Tile({
   isSelf,
   compact,
   onPin,
+  onMenu,
 }: TileProps) {
   const videoRef = useTrack<HTMLVideoElement>(video)
   // Metered for everyone including ourselves: seeing your own ring light up is
@@ -196,6 +404,14 @@ function Tile({
   // out from someone else that it never was.
   const speaking = useSpeaking(audio)
   const health = useStore((s) => s.health[peer.id])
+  const micBoost = useStore((s) => s.settings.micBoost)
+  const volume = useStore((s) => s.settings.peerVolume[peer.id] ?? 1)
+  const locallyMuted = useStore((s) => s.peerMuted[peer.id] ?? false)
+
+  // A boost is invisible by definition, and a person silenced by us sounds
+  // exactly like a person whose connection died. Both are worth a badge.
+  const gain = isSelf ? micBoost : volume
+  const silenced = !isSelf && locallyMuted
 
   // Only worth saying something while it is not working. A settled connection
   // needs no badge.
@@ -209,6 +425,7 @@ function Tile({
     <div
       className={`tile ${compact ? 'tile--compact' : ''} ${speaking ? 'tile--speaking' : ''}`}
       onDoubleClick={onPin}
+      onContextMenu={onMenu}
     >
       {status && <span className="tile__status">{status}</span>}
       {video ? (
@@ -235,6 +452,16 @@ function Tile({
           {isSelf && <span className="tile__you">you</span>}
         </span>
         <span className="tile__badges">
+          {silenced && (
+            <span title="Silenced for you only">
+              <SpeakerOffIcon size={14} className="muted" />
+            </span>
+          )}
+          {!silenced && gain !== 1 && (
+            <span className="tile__gain" title={isSelf ? 'Microphone boost' : 'Their volume, here'}>
+              {Math.round(gain * 100)}%
+            </span>
+          )}
           {sharing && <ScreenIcon size={14} />}
           {micMuted ? <MicOffIcon size={14} className="muted" /> : speaking && <SpeakerIcon size={14} />}
         </span>
@@ -253,10 +480,30 @@ export function Stage() {
   const pinned = useStore((s) => s.pinned)
   const setPinned = useStore((s) => s.setPinned)
   const createRoom = useStore((s) => s.createRoom)
+  const peerVolume = useStore((s) => s.settings.peerVolume)
+  const peerMuted = useStore((s) => s.peerMuted)
+  const [menu, setMenu] = useState<MenuAt | null>(null)
+  // Stable, so the menu's outside-click listener is not torn down and rebuilt
+  // on every stats tick.
+  const closeMenu = useCallback(() => setMenu(null), [])
   const cameraOnFor = (peerId: string): boolean =>
     peerId === me?.id ? localPresence.cameraOn : (presence[peerId]?.cameraOn ?? false)
 
   const members = room?.members ?? []
+
+  /** Deafening beats silencing one person, which beats their stored volume. */
+  const volumeFor = (peerId: string): number => {
+    if (localPresence.deafened || peerMuted[peerId]) return 0
+    return peerVolume[peerId] ?? 1
+  }
+
+  const openMenu = (peerId: string) => (event: MouseEvent) => {
+    event.preventDefault()
+    // Filmstrip tiles sit inside the presenter, which has its own handler; the
+    // tile the pointer is actually over is the one that should win.
+    event.stopPropagation()
+    setMenu({ peerId, x: event.clientX, y: event.clientY })
+  }
 
   /**
    * Whoever is sharing takes the stage. An explicit pin wins; otherwise the
@@ -307,14 +554,19 @@ export function Stage() {
           .filter((m) => m.id !== me?.id)
           .map((m) => (
             <div key={m.id}>
-              <RemoteAudio track={remoteTracks[m.id]?.mic} muted={localPresence.deafened} />
-              <RemoteAudio track={remoteTracks[m.id]?.screenAudio} muted={localPresence.deafened} />
+              <RemoteAudio track={remoteTracks[m.id]?.mic} volume={volumeFor(m.id)} />
+              <RemoteAudio track={remoteTracks[m.id]?.screenAudio} volume={volumeFor(m.id)} />
             </div>
           ))}
       </div>
 
       {presenterTrack ? (
-        <div className="presenter">
+        <div
+          className="presenter"
+          // The filmstrip tile is still there, but the thing filling the screen
+          // is what a right-click will land on.
+          onContextMenu={presenter ? openMenu(presenter) : undefined}
+        >
           <video ref={presenterRef} autoPlay playsInline muted className="presenter__video" />
           <div className="presenter__label">
             <ScreenIcon size={14} />
@@ -347,6 +599,7 @@ export function Stage() {
                 cameraOn={cameraOnFor(member.id)}
                 isSelf={member.id === me?.id}
                 onPin={() => setPinned(member.id)}
+                onMenu={openMenu(member.id)}
               />
             ))}
           </div>
@@ -372,6 +625,7 @@ export function Stage() {
               cameraOn={cameraOnFor(member.id)}
               isSelf={member.id === me?.id}
               onPin={() => setPinned(member.id)}
+              onMenu={openMenu(member.id)}
             />
           ))}
         </div>
@@ -383,6 +637,8 @@ export function Stage() {
           You're the only one here. Invite a friend from the sidebar.
         </div>
       )}
+
+      {menu && <PeerMenu {...menu} onClose={closeMenu} />}
     </section>
   )
 }

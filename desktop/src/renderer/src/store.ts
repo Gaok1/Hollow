@@ -1,6 +1,14 @@
 import { create } from 'zustand'
 import { Mesh, type LinkHealth } from './lib/mesh'
-import { BroadcastAudio, openCamera, openMicrophone, openScreen } from './lib/media'
+import {
+  BroadcastAudio,
+  MIC_BOOST_MAX,
+  PEER_VOLUME_MAX,
+  openCamera,
+  openMicrophone,
+  openScreen,
+  type MicrophoneSource,
+} from './lib/media'
 import type {
   AppInfo,
   FileTransfer,
@@ -18,6 +26,13 @@ import type {
  */
 let mesh: Mesh | null = null
 const broadcastAudio = new BroadcastAudio()
+
+/**
+ * The live microphone chain, for the same reason the mesh lives out here: it
+ * owns a device and an audio graph, neither of which survives being copied into
+ * a new state object on every render.
+ */
+let micSource: MicrophoneSource | null = null
 
 const rpc = <T = unknown,>(method: string, params?: unknown): Promise<T> =>
   window.hollow.request(method, params) as Promise<T>
@@ -65,20 +80,52 @@ export interface Settings {
   cameraId?: string
   /** Screen share frame rate. 60 for motion, 15 for reading documents. */
   screenFrameRate: number
+  /**
+   * Gain applied to the microphone before it is sent, where 1 is untouched.
+   * See {@link MIC_BOOST_MAX}.
+   */
+  micBoost: number
+  /**
+   * How loud each person is played, keyed by SteamID64, where 1 is untouched.
+   *
+   * Kept rather than reset per call: someone who records quiet records quiet
+   * every time, and having to find the slider again on every call is the kind
+   * of small tax that makes people stop bothering. Only entries that differ
+   * from 1 are stored, so this stays the size of the problem.
+   */
+  peerVolume: Record<string, number>
   /** Optional TURN relay for peers behind symmetric NAT. */
   turnUrl?: string
   turnUsername?: string
   turnCredential?: string
 }
 
-const DEFAULT_SETTINGS: Settings = { screenFrameRate: 30 }
+const DEFAULT_SETTINGS: Settings = { screenFrameRate: 30, micBoost: 1, peerVolume: {} }
+
+/**
+ * A gain, in range and to two decimals.
+ *
+ * The rounding is what makes "is this untouched?" answerable. A range input
+ * stepping by 0.05 can hand back 1.0000000000000002, and a peer volume that is
+ * merely almost 1 would be stored forever as an override nobody set.
+ */
+const clampGain = (value: number, max: number): number =>
+  Number.isFinite(value) ? Math.round(Math.min(max, Math.max(0, value)) * 100) / 100 : 1
 
 const SETTINGS_KEY = 'hollow.settings'
 
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
-    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS
+    if (!raw) return DEFAULT_SETTINGS
+    const stored = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } as Settings
+    // Written by an older build, or by hand. A gain read back as undefined
+    // would silence the microphone, which is a poor way to learn about it.
+    return {
+      ...stored,
+      micBoost: Number.isFinite(stored.micBoost) ? stored.micBoost : 1,
+      peerVolume: stored.peerVolume ?? {},
+    }
   } catch {
     return DEFAULT_SETTINGS
   }
@@ -115,6 +162,15 @@ interface State {
   presence: Record<string, Presence>
   /** What each link is doing, keyed by SteamID64. Drives every status the UI shows. */
   health: Record<string, LinkHealth>
+  /**
+   * Who is silenced for us only, keyed by SteamID64.
+   *
+   * Deliberately not persisted, unlike the volumes beside it: a volume is an
+   * opinion about how someone sounds, silencing them is an opinion about right
+   * now. Coming back to a call where a friend is inexplicably mute, with no
+   * memory of having done it, is a bug report waiting to happen.
+   */
+  peerMuted: Record<string, boolean>
   chat: ChatMessage[]
   /** Messages that arrived while the panel was closed. */
   chatUnread: number
@@ -158,6 +214,12 @@ interface State {
   setSessionVolume(pid: number, volume: number, muted: boolean): Promise<void>
   setMasterGain(gain: number): Promise<void>
 
+  /** Gain on what we send, 0 to {@link MIC_BOOST_MAX}. Applies to the live call at once. */
+  setMicBoost(boost: number): void
+  /** Gain on what we hear from one person, 0 to {@link PEER_VOLUME_MAX}. */
+  setPeerVolume(peerId: string, volume: number): void
+  togglePeerMuted(peerId: string): void
+
   sendChat(text: string): Promise<void>
   refreshFriends(): Promise<void>
   openLog(): Promise<void>
@@ -185,6 +247,7 @@ export const useStore = create<State>((set, get) => ({
   room: null,
   presence: {},
   health: {},
+  peerMuted: {},
   chat: [],
   chatUnread: 0,
   remoteTracks: {},
@@ -261,6 +324,7 @@ export const useStore = create<State>((set, get) => ({
           remoteTracks: {},
           health: {},
           presence: {},
+          peerMuted: {},
           pinned: null,
           chat: [],
           chatUnread: 0,
@@ -540,13 +604,16 @@ export const useStore = create<State>((set, get) => ({
    * log from all three processes.
    */
   async copyReport() {
-    const { info, room, me, health } = get()
+    const { info, room, me, health, settings, peerMuted } = get()
     const lines: string[] = [
       `Hollow ${info?.version ?? '?'} — ${info?.backend ?? '?'} backend, app id ${info?.appId ?? '?'}`,
       `Windows build ${info?.capabilities.windowsBuild ?? '?'}, per-process capture ${
         info?.capabilities.perProcessCapture ? 'yes' : 'no'
       }`,
       `Room: ${room ? `${room.name} (${room.members.length}/${room.maxMembers})` : 'none'}`,
+      // "They sound quiet" and "they are at 40% here" are the same report until
+      // one of them is written down.
+      `Microphone boost: ${Math.round(settings.micBoost * 100)}%`,
       '',
       'Links:',
     ]
@@ -555,8 +622,13 @@ export const useStore = create<State>((set, get) => ({
     if (peers.length === 0) lines.push('  (nobody else in the room)')
     for (const peer of peers) {
       const link = health[peer.id]
+      const heard = peerMuted[peer.id]
+        ? ', silenced here'
+        : settings.peerVolume[peer.id] !== undefined
+          ? `, played at ${Math.round(settings.peerVolume[peer.id] * 100)}%`
+          : ''
       if (!link) {
-        lines.push(`  ${peer.persona}: no link`)
+        lines.push(`  ${peer.persona}: no link${heard}`)
         continue
       }
       const candidates = Object.entries(link.candidates)
@@ -571,7 +643,8 @@ export const useStore = create<State>((set, get) => ({
           `up ${Math.round(link.quality.outBps / 1000)}kbps down ${Math.round(
             link.quality.inBps / 1000,
           )}kbps, avail ${Math.round(link.quality.availableBps / 1000)}kbps, ` +
-          `offers unanswered ${link.unansweredOffers}, candidates ${candidates || 'none'}`,
+          `offers unanswered ${link.unansweredOffers}, candidates ${candidates || 'none'}` +
+          heard,
       )
     }
 
@@ -599,7 +672,10 @@ export const useStore = create<State>((set, get) => ({
   async leaveRoom() {
     await get().stopShare()
     const { local } = get()
-    local.mic?.stop()
+    // The track we sent is the far end of the gain chain, so stopping it frees
+    // nothing — only the chain owns the device.
+    micSource?.stop()
+    micSource = null
     local.camera?.stop()
     await mesh?.setLocalTrack('mic', null)
     await mesh?.setLocalTrack('camera', null)
@@ -639,10 +715,12 @@ export const useStore = create<State>((set, get) => ({
     }
 
     try {
-      const track = await openMicrophone(settings.microphoneId)
-      await mesh?.setLocalTrack('mic', track)
+      // A chain left over from a failed open would keep the device to itself.
+      micSource?.stop()
+      micSource = await openMicrophone(settings.microphoneId, settings.micBoost)
+      await mesh?.setLocalTrack('mic', micSource.track)
       const presence = { ...localPresence, micMuted: false }
-      set({ local: { ...local, mic: track }, localPresence: presence })
+      set({ local: { ...local, mic: micSource.track }, localPresence: presence })
       await rpc('presence.set', presence)
     } catch (err) {
       log(`microphone failed — ${err}`)
@@ -804,6 +882,25 @@ export const useStore = create<State>((set, get) => ({
 
   async setMasterGain(gain) {
     await rpc('audio.master', { gain })
+  },
+
+  setMicBoost(boost) {
+    get().updateSettings({ micBoost: clampGain(boost, MIC_BOOST_MAX) })
+    // The chain is already negotiated and sending; this only moves a gain node,
+    // so a boost changed mid-sentence is heard on the next word.
+    micSource?.setBoost(get().settings.micBoost)
+  },
+
+  setPeerVolume(peerId, volume) {
+    const next = clampGain(volume, PEER_VOLUME_MAX)
+    const peerVolume = { ...get().settings.peerVolume }
+    if (next === 1) delete peerVolume[peerId]
+    else peerVolume[peerId] = next
+    get().updateSettings({ peerVolume })
+  },
+
+  togglePeerMuted(peerId) {
+    set((s) => ({ peerMuted: { ...s.peerMuted, [peerId]: !s.peerMuted[peerId] } }))
   },
 
   updateSettings(patch) {

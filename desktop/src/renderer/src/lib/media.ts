@@ -57,13 +57,84 @@ export interface DeviceChoice {
 }
 
 /**
+ * How far the microphone may be pushed before sending.
+ *
+ * Three is enough to rescue a genuinely quiet headset. Past it the limiter is
+ * doing all the work and the noise floor comes up with the voice, so there is
+ * nothing left to gain.
+ */
+export const MIC_BOOST_MAX = 3
+
+/**
+ * And how far down.
+ *
+ * Halving is the fix for a microphone that is too hot; going all the way to
+ * silence is not, because a microphone that is silently off is exactly the bug
+ * this whole feature exists to make visible. Mute does that job, and says so.
+ */
+export const MIC_BOOST_MIN = 0.5
+
+/** How far one person's incoming audio may be pushed. */
+export const PEER_VOLUME_MAX = 2
+
+const clampGain = (value: number, max: number): number =>
+  Number.isFinite(value) ? Math.min(max, Math.max(0, value)) : 1
+
+/**
+ * A limiter, not a compressor.
+ *
+ * Gain above 1 is the point of a booster and also the quickest way to turn
+ * speech into square waves. One of these sits after every boost with its
+ * threshold just under full scale: inaudible until something would have
+ * clipped, and catching it when it does.
+ */
+function createLimiter(context: AudioContext): DynamicsCompressorNode {
+  const limiter = context.createDynamicsCompressor()
+  limiter.threshold.value = -3
+  limiter.knee.value = 0
+  limiter.ratio.value = 20
+  limiter.attack.value = 0.003
+  limiter.release.value = 0.25
+  return limiter
+}
+
+/** A gain change, ramped. Stepping a gain node is an audible click. */
+const ramp = (gain: GainNode, value: number, context: AudioContext): void => {
+  gain.gain.setTargetAtTime(value, context.currentTime, 0.02)
+}
+
+/**
+ * The microphone, and the boost applied to it before anyone else hears it.
+ *
+ * The track handed out is not the device's — it is the far end of a gain stage,
+ * so the boost is baked into what WebRTC sends rather than into what this
+ * machine plays. That is the whole reason the chain exists: a microphone nobody
+ * can hear is not fixed by turning your own speakers up.
+ */
+export interface MicrophoneSource {
+  /** What to send. Muting still works: it is a `MediaStreamTrack` like any other. */
+  track: MediaStreamTrack
+  /** Change the boost mid-call. Costs no renegotiation — the track is unchanged. */
+  setBoost(boost: number): void
+  /** Releases the device. The track alone cannot: it is ours, not the device's. */
+  stop(): void
+}
+
+/**
  * Microphone capture.
  *
  * Echo cancellation, noise suppression and gain control are all on: this track
  * carries a person talking in a room where the call is also playing out of the
  * speakers. The screen-audio track deliberately gets none of them.
+ *
+ * The boost is applied after all three. Chromium's own gain control runs inside
+ * the capture pipeline, so it has already had its say by the time the signal
+ * reaches this graph and will not quietly undo the setting.
  */
-export async function openMicrophone(deviceId?: string): Promise<MediaStreamTrack> {
+export async function openMicrophone(
+  deviceId?: string,
+  boost = 1,
+): Promise<MicrophoneSource> {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: deviceId ? { exact: deviceId } : undefined,
@@ -74,7 +145,38 @@ export async function openMicrophone(deviceId?: string): Promise<MediaStreamTrac
     },
     video: false,
   })
-  return stream.getAudioTracks()[0]
+  const device = stream.getAudioTracks()[0]
+
+  const context = sharedAudioContext()
+  // Awaited here and nowhere else: a suspended context would hand back a track
+  // that carries silence, and silence is indistinguishable from a call that is
+  // working until somebody says so. Everything else in this file can afford to
+  // start a beat late.
+  await context.resume().catch(() => {})
+
+  const source = context.createMediaStreamSource(stream)
+  const gain = context.createGain()
+  gain.gain.value = clampGain(boost, MIC_BOOST_MAX)
+  const limiter = createLimiter(context)
+  const destination = context.createMediaStreamDestination()
+  source.connect(gain).connect(limiter).connect(destination)
+
+  const track = destination.stream.getAudioTracks()[0]
+  // The device ending — unplugged, or taken by another app — has to reach the
+  // track we handed out, or the call goes silent with nothing to show for it.
+  device.onended = () => track.stop()
+
+  return {
+    track,
+    setBoost: (next) => ramp(gain, clampGain(next, MIC_BOOST_MAX), context),
+    stop() {
+      source.disconnect()
+      gain.disconnect()
+      limiter.disconnect()
+      track.stop()
+      device.stop()
+    },
+  }
 }
 
 export async function openCamera(deviceId?: string): Promise<MediaStreamTrack> {
@@ -207,22 +309,91 @@ export class BroadcastAudio {
 }
 
 /**
- * One `AudioContext` shared by every meter on the page.
+ * One `AudioContext` shared by every meter, boost and sink on the page.
  *
  * A meter used to open its own, which is fine at one or two and stops being
- * fine in a full room: one per tile, plus the control bar, plus the broadcast
- * mixer. Analysers are cheap, contexts are not, and Chromium caps how many a
- * document may hold at once.
+ * fine in a full room: one per tile, plus the control bar, plus the mixer, plus
+ * a gain stage for the microphone and one per person being listened to.
+ * Analysers are cheap, contexts are not, and Chromium caps how many a document
+ * may hold at once.
  */
-let meterContext: AudioContext | null = null
+let audioContext: AudioContext | null = null
 
-function sharedMeterContext(): AudioContext {
-  if (!meterContext || meterContext.state === 'closed') {
-    meterContext = new AudioContext()
+function sharedAudioContext(): AudioContext {
+  if (!audioContext || audioContext.state === 'closed') {
+    audioContext = new AudioContext()
   }
   // Autoplay policy can leave it suspended until the page is interacted with.
-  void meterContext.resume().catch(() => {})
-  return meterContext
+  void audioContext.resume().catch(() => {})
+  return audioContext
+}
+
+/**
+ * Plays one remote track, at a volume that may exceed 100%.
+ *
+ * `HTMLMediaElement.volume` stops at 1, which is no use to someone whose friend
+ * simply records quiet, so playback goes through a gain node instead and the
+ * element is kept muted beside it — both as the sink that keeps a remote stream
+ * being pulled, and as the fallback below.
+ *
+ * That fallback matters more than the boost does. If the shared context is
+ * suspended, routing playback through it would mean hearing nobody at all, so a
+ * context that is not running hands the audio back to the element and gives up
+ * only the part above 100%.
+ */
+export interface AudioSink {
+  /** 0 to {@link PEER_VOLUME_MAX}, where 1 is untouched. */
+  setVolume(volume: number): void
+  close(): void
+}
+
+export function playRemoteTrack(
+  track: MediaStreamTrack,
+  element: HTMLAudioElement,
+): AudioSink {
+  const stream = new MediaStream([track])
+  element.srcObject = stream
+  // Autoplay can still be refused if the window has never been interacted with;
+  // joining a call counts, so this is belt and braces.
+  void element.play().catch(() => {})
+
+  const context = sharedAudioContext()
+  const source = context.createMediaStreamSource(stream)
+  const gain = context.createGain()
+  const limiter = createLimiter(context)
+  source.connect(gain).connect(limiter).connect(context.destination)
+
+  let volume = 1
+  let closed = false
+
+  const route = () => {
+    if (closed) return
+    if (context.state === 'running') {
+      element.muted = true
+      ramp(gain, volume, context)
+    } else {
+      element.muted = volume === 0
+      element.volume = Math.min(1, volume)
+    }
+  }
+
+  context.addEventListener('statechange', route)
+  route()
+
+  return {
+    setVolume(next) {
+      volume = clampGain(next, PEER_VOLUME_MAX)
+      route()
+    },
+    close() {
+      closed = true
+      context.removeEventListener('statechange', route)
+      source.disconnect()
+      gain.disconnect()
+      limiter.disconnect()
+      element.srcObject = null
+    },
+  }
 }
 
 /**
@@ -234,7 +405,7 @@ export function meterTrack(
   track: MediaStreamTrack,
   onLevel: (level: number) => void,
 ): () => void {
-  const context = sharedMeterContext()
+  const context = sharedAudioContext()
   const source = context.createMediaStreamSource(new MediaStream([track]))
   const analyser = context.createAnalyser()
   analyser.fftSize = 512

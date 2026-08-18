@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
-import { listDevices } from '../lib/media'
+import { MIC_BOOST_MAX, MIC_BOOST_MIN, listDevices } from '../lib/media'
 import type { AppAudioSession } from '../types'
+import { useMicLevel } from './controls'
 import { CloseIcon, SpeakerIcon, SpeakerOffIcon } from './icons'
 
 /** A peak meter. Rendered as a bar rather than a number: nobody reads dBFS. */
@@ -215,6 +216,10 @@ export function SettingsPanel() {
   const openLog = useStore((s) => s.openLog)
   const revealLog = useStore((s) => s.revealLog)
   const copyReport = useStore((s) => s.copyReport)
+  const setMicBoost = useStore((s) => s.setMicBoost)
+  const mic = useStore((s) => s.local.mic)
+  const micMuted = useStore((s) => s.localPresence.micMuted)
+  const micLevel = useMicLevel()
   const [devices, setDevices] = useState<Awaited<ReturnType<typeof listDevices>> | null>(null)
   const [copied, setCopied] = useState(false)
 
@@ -254,6 +259,36 @@ export function SettingsPanel() {
             </option>
           ))}
         </select>
+      </section>
+
+      <section className="field">
+        <label htmlFor="boost">Microphone boost</label>
+        <div className="boost">
+          <input
+            id="boost"
+            className="slider"
+            type="range"
+            min={MIC_BOOST_MIN}
+            max={MIC_BOOST_MAX}
+            step={0.05}
+            value={settings.micBoost}
+            onChange={(e) => setMicBoost(Number(e.target.value))}
+          />
+          <span className="boost__value">{Math.round(settings.micBoost * 100)}%</span>
+        </div>
+        <Meter level={micLevel} active={Boolean(mic) && !micMuted} />
+        <p className="field__hint">
+          {!mic
+            ? 'The meter moves once you are in a call with your microphone on.'
+            : micMuted
+              ? 'Unmute to watch the level while you set this.'
+              : 'The meter shows what the others receive, boost included. Aim for the bar moving well across on normal speech — a limiter catches the peaks, so this will not clip.'}
+        </p>
+        {settings.micBoost !== 1 && (
+          <button className="btn btn--ghost btn--tiny" onClick={() => setMicBoost(1)}>
+            Reset to 100%
+          </button>
+        )}
       </section>
 
       <section className="field">

@@ -676,6 +676,16 @@ select {
   color: var(--danger);
 }
 
+/* A boost is silent evidence of itself; this is the visible half. */
+.tile__gain {
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
 .tile__status {
   position: absolute;
   top: 8px;
@@ -689,6 +699,79 @@ select {
   border: 1px solid rgba(255, 179, 64, 0.28);
   border-radius: 999px;
   padding: 3px 8px;
+}
+
+/* --- the right-click menu on a participant -------------------------------- */
+
+.menu {
+  position: fixed;
+  /* Over the stage and the control bar, under modals and toasts. */
+  z-index: 35;
+  width: 246px;
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.menu__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 6px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+
+.menu__name {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 6px;
+}
+
+.menu__value {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  /* Fixed, so the slider does not shuffle sideways as the number grows. */
+  min-width: 34px;
+  text-align: right;
+}
+
+.menu__hint {
+  padding: 0 6px 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+.menu__item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+
+.menu__item:hover {
+  background: var(--surface-hover);
 }
 
 .presenter {
@@ -1139,6 +1222,34 @@ select {
   font-size: 11px;
   line-height: 1.45;
   color: var(--text-faint);
+}
+
+.boost {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+/*
+ * `.field input` dresses text boxes, and is the more specific selector, so a
+ * range input inside a field would arrive wearing a text box's border.
+ */
+.boost .slider {
+  width: auto;
+  height: 3px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line-strong);
+}
+
+.boost__value {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: right;
 }
 
 .diag {
