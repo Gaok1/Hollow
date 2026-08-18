@@ -24,3 +24,4 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 base64 = "0.22"
 directories = "5.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

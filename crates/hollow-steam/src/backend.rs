@@ -22,6 +22,12 @@ pub enum SteamCommand {
     InviteFriend { id: SteamId },
     /// Publish our own presence to the room.
     SetPresence(Presence),
+    /// Who may reach us while no call is running.
+    ///
+    /// The lobby answers that question during a call and cannot answer it at
+    /// any other time, so servers, direct messages and sending someone a file
+    /// outside a call all depend on this list being kept current by the caller.
+    SetAllowedPeers(Vec<SteamId>),
     /// Deliver an application payload to one peer.
     Send {
         to: SteamId,

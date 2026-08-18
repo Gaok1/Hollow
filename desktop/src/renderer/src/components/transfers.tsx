@@ -25,13 +25,29 @@ export function Transfers() {
   const respond = useStore((s) => s.respondToOffer)
   const dismiss = useStore((s) => s.dismissTransfer)
   const room = useStore((s) => s.room)
+  const friends = useStore((s) => s.friends)
+  const conversations = useStore((s) => s.conversations)
 
   if (transfers.length === 0) return null
+
+  /**
+   * Who this transfer is with.
+   *
+   * Three places to look, because a transfer no longer implies a call: the room
+   * covers the old case, the friends list covers sending someone a file out of
+   * the blue, and the conversations cover a fellow server member who is not on
+   * the friends list. Falling through all three would print "peer", which tells
+   * nobody anything.
+   */
+  const peerFor = (id: string) =>
+    room?.members.find((m) => m.id === id) ??
+    friends.find((f) => f.id === id) ??
+    conversations.flatMap((c) => c.members).find((m) => m.id === id)
 
   return (
     <div className="transfers">
       {transfers.map((transfer) => {
-        const peer = room?.members.find((m) => m.id === transfer.peer)
+        const peer = peerFor(transfer.peer)
         const pct = transfer.size > 0 ? transfer.transferred / transfer.size : 0
 
         return (

@@ -55,6 +55,42 @@ struct Gate {
     lobby: Option<u64>,
     /// Its members, as of the last reconciliation.
     members: HashSet<u64>,
+    /// Accounts allowed in without a lobby: Steam friends, and anyone sharing a
+    /// server with us.
+    ///
+    /// The lobby alone used to be the whole answer, which meant nothing could
+    /// reach us unless a call was already running. That is the right rule for
+    /// signaling and the wrong one for everything added since: a server message
+    /// arrives between calls by definition, and sending a friend a file was
+    /// impossible without first phoning them.
+    ///
+    /// This widens the door, it does not remove it. A stranger — nobody on the
+    /// friends list, nobody sharing a server — is still refused, and a file
+    /// still cannot land on disk without the user accepting the offer.
+    allowed: HashSet<u64>,
+}
+
+impl Gate {
+    /// Whether `raw` may open a session or be heard from, on the cached state
+    /// alone. Callers that can afford to ask Steam do so before saying no.
+    fn admits(&self, raw: u64) -> bool {
+        self.members.contains(&raw) || self.allowed.contains(&raw)
+    }
+
+    fn enter(&mut self, lobby: u64, members: HashSet<u64>) {
+        self.lobby = Some(lobby);
+        self.members = members;
+    }
+
+    /// Forget the lobby, keeping the standing allow list.
+    ///
+    /// The distinction matters: the allow list is what a friend reaches us
+    /// through *after* the call ends, and clearing the whole gate on the way out
+    /// would silently make the app one-way until the next restart.
+    fn leave(&mut self) {
+        self.lobby = None;
+        self.members.clear();
+    }
 }
 
 /// Results that Steam callbacks produce but cannot act on directly: the
@@ -134,8 +170,8 @@ impl SteamRealBackend {
     }
 
     fn install_callbacks(&mut self) {
-        // Only peers in our lobby may open a session with us. Without this any
-        // Steam user could push signaling traffic at us.
+        // Only peers in our lobby, or on the allow list, may open a session with
+        // us. Without this any Steam user could push signaling traffic at us.
         let gate = Arc::clone(&self.gate);
         let client = self.client.clone();
         let tx = self.tx.clone();
@@ -155,9 +191,9 @@ impl SteamRealBackend {
                 // query a local lookup rather than a round trip.
                 let (lobby, cached) = {
                     let g = gate.lock();
-                    (g.lobby, g.members.contains(&raw))
+                    (g.lobby, g.admits(raw))
                 };
-                let member = cached
+                let welcome = cached
                     || lobby.is_some_and(|id| {
                         client
                             .matchmaking()
@@ -166,7 +202,7 @@ impl SteamRealBackend {
                             .any(|s| s.raw() == raw)
                     });
 
-                if member {
+                if welcome {
                     gate.lock().members.insert(raw);
                     req.accept();
                     let _ = tx.send(Internal::Event(SteamEvent::Diagnostic(format!(
@@ -175,7 +211,7 @@ impl SteamRealBackend {
                 } else {
                     // Returning without accepting rejects the request.
                     let _ = tx.send(Internal::Event(SteamEvent::Diagnostic(format!(
-                        "p2p: refused session from {raw}, not a member of this room"
+                        "p2p: refused session from {raw}, not a friend and not in this room"
                     ))));
                 }
             });
@@ -308,7 +344,7 @@ impl SteamRealBackend {
         if member_raws.is_empty() {
             // The lobby evaporated.
             self.room = None;
-            *self.gate.lock() = Gate::default();
+            self.gate.lock().leave();
             out.push(SteamEvent::RoomLeft);
             return;
         }
@@ -334,10 +370,7 @@ impl SteamRealBackend {
             out.push(SteamEvent::PeerLeft(SteamId(*raw)));
         }
 
-        *self.gate.lock() = Gate {
-            lobby: Some(current.id.raw()),
-            members: now,
-        };
+        self.gate.lock().enter(current.id.raw(), now);
 
         let members: Vec<Peer> = member_raws.iter().map(|r| self.peer_from_raw(*r)).collect();
         let owner = self.client.matchmaking().lobby_owner(lobby).raw();
@@ -353,7 +386,8 @@ impl SteamRealBackend {
         out.push(SteamEvent::RoomUpdated(room));
     }
 
-    /// Whether a peer is entitled to talk to us, which means: is it in our lobby.
+    /// Whether a peer is entitled to talk to us: is it in our lobby, or on the
+    /// standing allow list of friends and fellow server members.
     ///
     /// The cached set is what the session-request callback sees, and it only
     /// refreshes when membership churn is noticed. A joiner's very first offer
@@ -361,10 +395,10 @@ impl SteamRealBackend {
     /// entered, while our own update is still in flight. Dropping that offer
     /// costs a call that never connects and never says why, so ask Steam
     /// directly before rejecting anyone.
-    fn is_room_member(&self, raw: u64) -> bool {
+    fn may_speak_to_us(&self, raw: u64) -> bool {
         let (lobby, cached) = {
             let g = self.gate.lock();
-            (g.lobby, g.members.contains(&raw))
+            (g.lobby, g.admits(raw))
         };
         if cached {
             return true;
@@ -398,7 +432,7 @@ impl SteamRealBackend {
                 continue;
             };
             let raw = from.raw();
-            if !self.is_room_member(raw) {
+            if !self.may_speak_to_us(raw) {
                 continue;
             }
             let payload = msg.data().to_vec();
@@ -552,7 +586,7 @@ impl SteamBackend for SteamRealBackend {
                             let _ = tx.send(Internal::LobbyJoined { id: lobby.raw() });
                         }
                         Err(_) => {
-                            *gate.lock() = Gate::default();
+                            gate.lock().leave();
                             let _ = tx.send(Internal::Event(SteamEvent::Error(
                                 "that room refused the connection".into(),
                             )));
@@ -565,7 +599,7 @@ impl SteamBackend for SteamRealBackend {
                     self.client
                         .matchmaking()
                         .leave_lobby(LobbyId::from_raw(room.id.raw()));
-                    *self.gate.lock() = Gate::default();
+                    self.gate.lock().leave();
                     let _ = self.tx.send(Internal::Event(SteamEvent::RoomLeft));
                 }
             }
@@ -588,6 +622,14 @@ impl SteamBackend for SteamRealBackend {
                     channel: Channel::Control,
                     payload,
                 })?;
+            }
+
+            SteamCommand::SetAllowedPeers(peers) => {
+                // Replaced wholesale rather than merged: unfriending someone, or
+                // leaving the last server you shared with them, has to actually
+                // close the door. A set that only ever grows would keep it open
+                // until the process restarted.
+                self.gate.lock().allowed = peers.into_iter().map(SteamId::raw).collect();
             }
 
             SteamCommand::Send {
@@ -676,10 +718,9 @@ impl SteamBackend for SteamRealBackend {
                         members: vec![self.me.clone()],
                         max_members: DEFAULT_MAX_MEMBERS,
                     });
-                    *self.gate.lock() = Gate {
-                        lobby: Some(id),
-                        members: HashSet::from([self.me.id.raw()]),
-                    };
+                    self.gate
+                        .lock()
+                        .enter(id, HashSet::from([self.me.id.raw()]));
                     if let Some(room) = self.room.clone() {
                         out.push(SteamEvent::RoomUpdated(room));
                     }
@@ -697,7 +738,7 @@ impl SteamBackend for SteamRealBackend {
                         != Some(ROOM_TAG)
                     {
                         self.client.matchmaking().leave_lobby(lobby);
-                        *self.gate.lock() = Gate::default();
+                        self.gate.lock().leave();
                         out.push(SteamEvent::Error(
                             "that lobby belongs to another app, not Hollow".into(),
                         ));
@@ -716,10 +757,9 @@ impl SteamBackend for SteamRealBackend {
                     // Open the gate before reconciling: the peers already in
                     // there knock the moment they see us arrive, and that knock
                     // can land before the first reconciliation does.
-                    *self.gate.lock() = Gate {
-                        lobby: Some(id),
-                        members: HashSet::from([self.me.id.raw()]),
-                    };
+                    self.gate
+                        .lock()
+                        .enter(id, HashSet::from([self.me.id.raw()]));
                     self.reconcile_room(out);
                 }
 

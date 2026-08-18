@@ -8,8 +8,11 @@
 //! Requests carry an `id` and get exactly one response. Events are unsolicited
 //! and carry no id.
 
+use hollow_steam::SteamId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::store::{Member, Message};
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -122,6 +125,69 @@ pub enum FileFrame {
 /// window a large file would be queued in its entirety before the first byte
 /// landed. 4MB keeps the pipe full without that.
 pub const FILE_WINDOW: u64 = 64 * FILE_CHUNK as u64;
+
+// ---------------------------------------------------------------------------
+// Servers and direct messages (Steam `Servers` channel)
+// ---------------------------------------------------------------------------
+
+/// Framing for membership and for keeping transcripts in step between peers.
+///
+/// Unlike the file frames beside it, these arrive when no call is running —
+/// that is the entire point of them — so nothing here may assume a lobby, a
+/// mesh, or that the sender is on screen anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "camelCase")]
+pub enum ServerFrame {
+    /// "Join this server." Carries the whole descriptor so that accepting is a
+    /// local write and not another round trip — the invitee may well be
+    /// accepting it while the person who sent it has gone offline.
+    Invite {
+        conversation: String,
+        name: String,
+        owner: SteamId,
+        created_at: i64,
+        members: Vec<Member>,
+    },
+    /// Somebody is in, announced to everyone the sender knows of.
+    Joined {
+        conversation: String,
+        member: Member,
+    },
+    Left {
+        conversation: String,
+        member: SteamId,
+    },
+    /// One message, pushed as it is written.
+    Post {
+        conversation: String,
+        message: Message,
+    },
+    /// "This is what I hold; send me the rest."
+    Sync {
+        conversation: String,
+        /// Highest `seq` held per author. Empty means "I have nothing".
+        have: Vec<(SteamId, u64)>,
+    },
+    /// The answer to a [`ServerFrame::Sync`].
+    ///
+    /// Carries the roster and the live call as well as the messages: someone
+    /// coming back after a week needs all three, and asking for them separately
+    /// would be three chances to half-succeed.
+    SyncReply {
+        conversation: String,
+        messages: Vec<Message>,
+        members: Vec<Member>,
+        call: Option<SteamId>,
+    },
+    /// A call started in this server. The lobby id is what everyone else joins.
+    CallStarted {
+        conversation: String,
+        lobby: SteamId,
+    },
+    CallEnded {
+        conversation: String,
+    },
+}
 
 /// Chunks are base64 inside JSON. That costs a third more bytes than a binary
 /// framing would, which is a fair trade for one message format across the whole

@@ -56,6 +56,7 @@ export function Toasts() {
   const toasts = useStore((s) => s.toasts)
   const dismiss = useStore((s) => s.dismissToast)
   const accept = useStore((s) => s.acceptInvite)
+  const respondToServer = useStore((s) => s.respondToServerInvite)
 
   if (toasts.length === 0) return null
 
@@ -72,6 +73,24 @@ export function Toasts() {
                 Ignore
               </button>
               <button className="btn btn--primary btn--tiny" onClick={() => void accept(toast)}>
+                Join
+              </button>
+            </div>
+          ) : toast.kind === 'server' ? (
+            // A server invite is a decision, not a notification: accepting puts
+            // a conversation on this machine and this account on other people's
+            // member lists, so it does not time out on its own.
+            <div className="toast__actions">
+              <button
+                className="btn btn--ghost btn--tiny"
+                onClick={() => void respondToServer(toast, false)}
+              >
+                Decline
+              </button>
+              <button
+                className="btn btn--primary btn--tiny"
+                onClick={() => void respondToServer(toast, true)}
+              >
                 Join
               </button>
             </div>

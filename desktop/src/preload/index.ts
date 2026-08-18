@@ -25,6 +25,14 @@ const api = {
    */
   getFilePath: (file: File): string => webUtils.getPathForFile(file),
 
+  /**
+   * Ask for files to send. Empty when the dialog was dismissed.
+   *
+   * The counterpart to {@link getFilePath}: dragging is the fast path, but
+   * sending someone a file should not require having a file manager open.
+   */
+  pickFiles: (): Promise<string[]> => ipcRenderer.invoke('files:pick'),
+
   screen: {
     sources: (): Promise<ScreenSource[]> => ipcRenderer.invoke('screen:sources'),
     choose: (sourceId: string | null): Promise<void> =>

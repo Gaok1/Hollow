@@ -135,8 +135,10 @@ impl SteamBackend for MockBackend {
                     failed: Vec::new(),
                 });
             }
-            // No transport: nothing to send to, nothing to hear back.
+            // No transport: nothing to send to, nothing to hear back, and no
+            // gate to widen because nothing can knock on it.
             SteamCommand::SetPresence(_)
+            | SteamCommand::SetAllowedPeers(_)
             | SteamCommand::Send { .. }
             | SteamCommand::Broadcast { .. } => {}
         }

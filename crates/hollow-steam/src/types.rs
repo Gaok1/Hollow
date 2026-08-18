@@ -169,6 +169,13 @@ pub enum Channel {
     /// and adding a second shape to that guess is how a chat message ends up
     /// interpreted as a mute.
     Chat = 3,
+    /// Servers and direct messages: invites, membership, persisted chat and the
+    /// history reconciliation between peers.
+    ///
+    /// The one channel that carries traffic while no call is running, which is
+    /// exactly why it is its own: everything on the others is meaningless
+    /// outside a lobby, and this has to work when there is no lobby at all.
+    Servers = 4,
 }
 
 impl Channel {
@@ -178,6 +185,7 @@ impl Channel {
             1 => Some(Channel::Control),
             2 => Some(Channel::Files),
             3 => Some(Channel::Chat),
+            4 => Some(Channel::Servers),
             _ => None,
         }
     }

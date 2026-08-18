@@ -73,6 +73,54 @@ export interface AppInfo {
   version: string
   /** The call already in progress, when the renderer reloads mid-call. */
   room?: Room | null
+  /** Which server that call belongs to, if any. */
+  conversation?: string | null
+}
+
+/**
+ * A server or a direct message.
+ *
+ * Both are the same thing to everything below the UI: a list of people and a
+ * transcript that survives the app closing. A server has a name and an owner; a
+ * DM is named after whoever is on the other end.
+ */
+export interface Conversation {
+  id: string
+  kind: 'server' | 'dm'
+  name: string
+  owner?: string
+  createdAt: number
+  members: Peer[]
+  unread: number
+  /** The lobby of the call running in here, or null when nobody is talking. */
+  call: string | null
+}
+
+/**
+ * One stored message.
+ *
+ * Identified by author and `seq` rather than by anything global: see the Rust
+ * side for why. `at` is the author's clock and is used only for ordering.
+ */
+export interface StoredMessage {
+  author: string
+  seq: number
+  at: number
+  text: string
+}
+
+/** Where a page of scrollback starts, reading backwards. */
+export interface HistoryCursor {
+  at: number
+  author: string
+  seq: number
+}
+
+/** An invitation to a server, waiting for the user to decide. */
+export interface ServerInvite {
+  id: string
+  name: string
+  from: string
 }
 
 export interface ScreenSource {
@@ -103,6 +151,7 @@ declare global {
       request(method: string, params?: unknown): Promise<unknown>
       onEvent(handler: (event: string, data: unknown) => void): () => void
       getFilePath(file: File): string
+      pickFiles(): Promise<string[]>
       screen: {
         sources(): Promise<ScreenSource[]>
         choose(sourceId: string | null): Promise<void>

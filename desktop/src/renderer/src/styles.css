@@ -162,12 +162,124 @@ select {
 .layout {
   flex: 1;
   display: grid;
-  grid-template-columns: 264px 1fr;
+  grid-template-columns: 62px 264px 1fr;
   min-height: 0;
 }
 
 .layout--panelled {
-  grid-template-columns: 264px 1fr 320px;
+  grid-template-columns: 62px 264px 1fr 320px;
+}
+
+/* --- server rail ---------------------------------------------------------- */
+
+/*
+ * The narrowest column, and deliberately the plainest: it is navigated by
+ * muscle memory rather than by reading, so position and shape carry the meaning
+ * and the only colour spent here is the one that says "live".
+ */
+.rail {
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+.rail__rule {
+  width: 24px;
+  height: 1px;
+  background: var(--line-strong);
+  flex-shrink: 0;
+}
+
+.rail__item {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--surface-raised);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 130ms var(--ease),
+    border-color 130ms var(--ease),
+    border-radius 130ms var(--ease),
+    color 130ms var(--ease);
+}
+
+.rail__item:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-radius: 15px;
+}
+
+/* Same recipe as every other active control in the app. */
+.rail__item--on {
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+.rail__item--new {
+  color: var(--text-faint);
+  border-style: dashed;
+}
+
+.rail__initials {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.rail__badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #04120d;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A call running in a server you are not looking at. */
+.rail__live {
+  position: absolute;
+  bottom: -3px;
+  right: -3px;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #04241c;
+}
+
+.rail__new input {
+  width: 42px;
+  background: var(--bg);
+  border: 1px solid var(--accent-line);
+  border-radius: 13px;
+  padding: 6px 4px;
+  font-size: 11px;
+  text-align: center;
+  outline: none;
 }
 
 /* --- sidebar -------------------------------------------------------------- */
@@ -297,11 +409,54 @@ select {
   background: var(--surface-hover);
 }
 
+/*
+ * The whole identity is the button that opens the conversation, so the target
+ * is the row and not a five-pixel name. It has to be stripped back to looking
+ * like text, because a row of buttons that look like buttons reads as a form.
+ */
 .friend__identity {
   display: flex;
   align-items: center;
   gap: 9px;
   min-width: 0;
+  flex: 1;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+
+.friend__identity:disabled {
+  cursor: default;
+}
+
+/* Actions stay out of the way until the row is under the pointer — a column of
+ * paperclips down the friends list is noise, not affordance. */
+.friend__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+
+.friend:hover .friend__actions,
+.friend:focus-within .friend__actions {
+  opacity: 1;
+}
+
+/* A file hovering over one person, rather than over the call. */
+.friend--drop {
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.friend--drop .friend__actions {
+  opacity: 1;
 }
 
 .friend__avatar {
@@ -325,6 +480,12 @@ select {
 .friend__state {
   font-size: 11px;
   color: var(--text-faint);
+}
+
+/* In chat the "you" badge is spaced by the author row's flex gap; a member row
+ * is plain text, so it needs the gap spelled out or the name runs into it. */
+.friend__name .chat__you {
+  margin-left: 5px;
 }
 
 .avatar {
@@ -456,6 +617,79 @@ select {
   color: #ffd39a;
   background: var(--warn-dim);
   border-color: rgba(255, 179, 64, 0.25);
+}
+
+.notice--live {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent-line);
+  text-align: center;
+}
+
+/* --- direct messages and server members ----------------------------------- */
+
+.dm {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 6px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+
+.dm:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.dm--on {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.dm__name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dm__badge {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #04120d;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.dm__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.server__call {
+  margin-bottom: 4px;
+}
+
+.server__add {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 4px;
+  margin: 0 0 6px;
 }
 
 /* --- stage ---------------------------------------------------------------- */
@@ -1602,6 +1836,64 @@ select {
 
 .chat__failed--partial {
   color: var(--warn);
+}
+
+/*
+ * The transcript read on its own, with no call in the way.
+ *
+ * Same list and same composer as the panel — only the width changes, and with
+ * it how much of a paragraph fits on a line. A conversation you are reading
+ * rather than glancing at deserves the middle of the window.
+ */
+.chatview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 10px;
+  padding: 14px 16px 16px;
+}
+
+.chatview__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chatview__head h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chatview__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* Long lines are hard to read; the transcript stops widening before the window
+ * does, and the composer stays with it. */
+.chatview .chat__scroll,
+.chatview .chat__compose {
+  width: 100%;
+  max-width: 760px;
+}
+
+/*
+ * Sit a short conversation on the composer instead of stranding it at the top
+ * of a tall empty column. `margin-top: auto` on the first line rather than
+ * `justify-content: flex-end` on the box: the latter clips the top of the
+ * content once it does overflow, which is precisely when you want to scroll up.
+ */
+.chatview .chat__scroll > :first-child {
+  margin-top: auto;
 }
 
 .chat__compose {

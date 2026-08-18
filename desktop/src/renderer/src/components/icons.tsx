@@ -167,6 +167,29 @@ export const RefreshIcon = ({ size = 14, className }: IconProps) => (
   </svg>
 )
 
+/** Sending someone a file: a page on its way up and out. */
+export const FileSendIcon = ({ size = 16, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8" />
+    <path d="M13 3v6h6" />
+    <path d="M12 18v-6M9.5 14.5 12 12l2.5 2.5" />
+  </svg>
+)
+
+/** Home, the friends list and everything not inside a server. */
+export const HomeIcon = ({ size = 20, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M4 10.5 12 4l8 6.5V19a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19z" />
+  </svg>
+)
+
+/** A live call, for the badge on a server that is talking. */
+export const CallIcon = ({ size = 14, className }: IconProps) => (
+  <svg {...base(size)} className={className}>
+    <path d="M4 7.5a13 13 0 0 0 12.5 12.5l2-2.6-3.6-2.2-2 1.6a10.5 10.5 0 0 1-5.7-5.7l1.6-2L6.6 5.5z" />
+  </svg>
+)
+
 export const SteamIcon = ({ size = 16, className }: IconProps) => (
   <svg {...base(size)} className={className}>
     <circle cx="12" cy="12" r="10" />

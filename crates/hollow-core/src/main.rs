@@ -15,6 +15,8 @@ mod files;
 mod pipe;
 mod protocol;
 mod rpc;
+mod servers;
+mod store;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

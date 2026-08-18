@@ -1,0 +1,84 @@
+name: CI
+
+# Runs on every push and every pull request, unlike `release.yml`, which only
+# does anything when a commit subject carries a version. Until this existed
+# nothing checked the Rust side at all: the release build typechecks the
+# renderer and never once runs `cargo test`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push supersedes the first; there is no point finishing a run for a
+# commit that has already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Windows, not Linux: the audio engine is built directly on WASAPI and the
+  # workspace does not compile anywhere else.
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-ci-
+
+      # Compiles every crate and every test target without running them. Catches
+      # a break anywhere in the workspace for a fraction of the cost of building
+      # the installer.
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+      # Scoped to `hollow-core`, which is warning-free. The other crates carry
+      # pre-existing lint noise, and `-D warnings` across all of them would fail
+      # on day one and teach everyone to ignore this job.
+      #
+      # `--no-deps` is what makes the scoping real: without it the deny applies
+      # to the path dependencies as they are compiled, and the job fails on
+      # warnings in crates it was never meant to police.
+      - name: Clippy
+        run: cargo clippy -p hollow-core --all-targets --no-deps -- -D warnings
+
+      # The part that has to be right and cannot be checked by reading: the
+      # version-vector reconciliation, deduplication, scrollback paging, and the
+      # two-peer round trip where one side was offline throughout.
+      - name: Test
+        run: cargo test -p hollow-core
+
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # `npm install` rather than `npm ci`: the lockfile is not committed, which
+      # `release.yml` already accounts for.
+      - name: Install
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: desktop
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: desktop
+        run: npm run build

@@ -1,6 +1,6 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { BrowserWindow, app, desktopCapturer, ipcMain, session, shell } from 'electron'
+import { BrowserWindow, app, desktopCapturer, dialog, ipcMain, session, shell } from 'electron'
 import { Sidecar } from './sidecar'
 import { AudioPipe } from './audio-pipe'
 
@@ -205,6 +205,25 @@ ipcMain.handle('screen:sources', async () => {
 /** Stage the chosen source; the display-media handler reads it next. */
 ipcMain.handle('screen:choose', (_e, sourceId: string | null) => {
   pendingScreenSource = sourceId
+})
+
+/**
+ * Pick files to send someone.
+ *
+ * Paths, not contents: the daemon streams the file off disk a chunk at a time,
+ * so reading gigabytes through the renderer to hand them straight back would be
+ * pure waste. Modal on the window so it cannot end up behind it.
+ */
+ipcMain.handle('files:pick', async () => {
+  const owner = window
+  const result = owner
+    ? await dialog.showOpenDialog(owner, {
+        title: 'Send files',
+        buttonLabel: 'Send',
+        properties: ['openFile', 'multiSelections'],
+      })
+    : await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'] })
+  return result.canceled ? [] : result.filePaths
 })
 
 ipcMain.handle('audio:connect', (_e, pipeName: string) => {

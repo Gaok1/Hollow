@@ -1,7 +1,7 @@
 {
   "name": "hollow",
-  "version": "0.3.4",
-  "description": "Peer-to-peer calls, screen sharing and file transfer over Steam",
+  "version": "0.4.1",
+  "description": "Servers, chat, calls and file transfer between Steam friends, with nothing in the middle",
   "main": "out/main/index.js",
   "author": "Luis Phillip Lemos Martins",
   "license": "MIT",

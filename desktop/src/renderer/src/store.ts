@@ -12,12 +12,15 @@ import {
 } from './lib/media'
 import type {
   AppInfo,
+  Conversation,
   FileTransfer,
+  HistoryCursor,
   MixerSnapshot,
   Peer,
   Presence,
   Room,
   ScreenSource,
+  StoredMessage,
   TrackSlot,
 } from './types'
 
@@ -69,11 +72,43 @@ export interface ChatMessage {
 
 export interface Toast {
   id: number
-  kind: 'info' | 'error' | 'invite'
+  kind: 'info' | 'error' | 'invite' | 'server'
   message: string
-  /** Present on invites: accepting joins this room. */
+  /** Present on call invites: accepting joins this room. */
   roomId?: string
+  /** Present on server invites: accepting joins this conversation. */
+  serverId?: string
   from?: Peer
+}
+
+/**
+ * Merge new messages into a conversation without duplicating or reordering.
+ *
+ * The same line legitimately arrives twice — once pushed as it was written, once
+ * again in a sync answer from somebody else who has it — so identity is
+ * `author:seq`, exactly as it is on disk. Order is by the author's clock, with
+ * the same tiebreak the daemon uses, so both ends show the transcript the same
+ * way round.
+ */
+export function mergeMessages(
+  existing: StoredMessage[],
+  incoming: StoredMessage[],
+): StoredMessage[] {
+  if (incoming.length === 0) return existing
+
+  const byId = new Map(existing.map((m) => [`${m.author}:${m.seq}`, m]))
+  let changed = false
+  for (const message of incoming) {
+    const key = `${message.author}:${message.seq}`
+    if (byId.has(key)) continue
+    byId.set(key, message)
+    changed = true
+  }
+  if (!changed) return existing
+
+  return [...byId.values()].sort(
+    (a, b) => a.at - b.at || a.author.localeCompare(b.author) || a.seq - b.seq,
+  )
 }
 
 export interface Settings {
@@ -231,6 +266,27 @@ interface State {
   chat: ChatMessage[]
   /** Messages that arrived while the panel was closed. */
   chatUnread: number
+
+  /** Every server and direct message, as the daemon last described them. */
+  conversations: Conversation[]
+  /**
+   * What the rail has selected, or null for Home.
+   *
+   * Home is the friends list and the idle stage; a selection is one server or
+   * one direct message.
+   */
+  selected: string | null
+  /** Loaded transcript per conversation, oldest first. */
+  messages: Record<string, StoredMessage[]>
+  /** Conversations whose scrollback has reached the beginning. */
+  historyDone: Record<string, boolean>
+  /**
+   * Which server the live call belongs to, or null for a call that belongs to
+   * nobody. That distinction is what decides whether the chat beside the call
+   * is written down or thrown away when it ends.
+   */
+  callConversation: string | null
+
   remoteTracks: Record<string, Partial<Record<TrackSlot, MediaStreamTrack>>>
 
   local: Partial<Record<TrackSlot, MediaStreamTrack>>
@@ -289,6 +345,22 @@ interface State {
   togglePeerMuted(peerId: string): void
 
   sendChat(text: string): Promise<void>
+
+  refreshConversations(): Promise<void>
+  selectConversation(id: string | null): Promise<void>
+  loadMoreHistory(id: string): Promise<void>
+  createServer(name: string): Promise<void>
+  inviteToServer(conversationId: string, peerId: string): Promise<void>
+  leaveServer(id: string): Promise<void>
+  /** Open the direct message with someone and select it. */
+  openDm(peerId: string): Promise<void>
+  sendMessage(conversationId: string, text: string): Promise<void>
+  startServerCall(id: string): Promise<void>
+  joinServerCall(id: string): Promise<void>
+  respondToServerInvite(toast: Toast, accept: boolean): Promise<void>
+  /** Ask for files and send them to one person. No call required. */
+  sendFilesTo(peerId: string): Promise<void>
+
   refreshFriends(): Promise<void>
   openLog(): Promise<void>
   /** Put a shareable diagnostic report on the clipboard. */
@@ -308,6 +380,13 @@ interface State {
 let toastSeq = 1
 /** Shared by sent and received messages so React keys never collide. */
 let chatSeq = 1
+/**
+ * Conversations with a scrollback request in flight.
+ *
+ * Beside the store rather than in it: this is not something anything renders,
+ * and putting it in state would redraw the transcript twice for every page.
+ */
+const loadingHistory = new Set<string>()
 
 export const useStore = create<State>((set, get) => ({
   info: null,
@@ -319,6 +398,11 @@ export const useStore = create<State>((set, get) => ({
   peerMuted: {},
   chat: [],
   chatUnread: 0,
+  conversations: [],
+  selected: null,
+  messages: {},
+  historyDone: {},
+  callConversation: null,
   remoteTracks: {},
   local: {},
   focus: null,
@@ -383,14 +467,15 @@ export const useStore = create<State>((set, get) => ({
      * reload mid-call gets its room from the latter, and the daemon will not
      * re-emit the event until membership actually churns.
      */
-    const applyRoom = (room: Room | null) => {
+    const applyRoom = (room: Room | null, conversation: string | null = null) => {
       const previous = get().room
-      set({ room })
+      set({ room, callConversation: room ? conversation : null })
 
       if (!room) {
         log('room: left')
         mesh?.closeAll()
-        // Chat dies with the room. That is the whole contract.
+        // The *ad-hoc* chat dies with the room. A server's chat is on disk and
+        // is not this state at all, which is the whole point of the split.
         set({
           remoteTracks: {},
           health: {},
@@ -403,6 +488,7 @@ export const useStore = create<State>((set, get) => ({
           chatOpen: false,
         })
         void get().stopShare()
+        void get().refreshConversations()
         return
       }
 
@@ -430,7 +516,9 @@ export const useStore = create<State>((set, get) => ({
     const pushToast = (toast: Omit<Toast, 'id'>) => {
       const id = toastSeq++
       set((s) => ({ toasts: [...s.toasts, { ...toast, id }] }))
-      if (toast.kind !== 'invite') {
+      // Invitations wait for an answer. Everything else is a notification and
+      // gets out of the way on its own.
+      if (toast.kind !== 'invite' && toast.kind !== 'server') {
         setTimeout(() => get().dismissToast(id), 6000)
       }
     }
@@ -454,8 +542,77 @@ export const useStore = create<State>((set, get) => ({
           set({ friends: data as Peer[] })
           break
 
-        case 'room':
-          applyRoom(data as Room | null)
+        case 'room': {
+          const payload = data as { room: Room; conversation: string | null } | null
+          applyRoom(payload?.room ?? null, payload?.conversation ?? null)
+          break
+        }
+
+        case 'conversations':
+          set({ conversations: data as Conversation[] })
+          break
+
+        case 'conv.changed':
+          void get().refreshConversations()
+          break
+
+        case 'conv.message': {
+          const { conversation, message } = data as {
+            conversation: string
+            message: StoredMessage
+          }
+          set((s) => {
+            const loaded = s.messages[conversation]
+            return {
+              // Only grow a transcript already on screen. Appending to one that
+              // was never opened would leave a hole between it and the history
+              // the daemon would hand over on opening.
+              messages: loaded
+                ? { ...s.messages, [conversation]: mergeMessages(loaded, [message]) }
+                : s.messages,
+            }
+          })
+          if (get().selected === conversation) {
+            void rpc('conv.markRead', { id: conversation, at: message.at })
+          }
+          void get().refreshConversations()
+          break
+        }
+
+        case 'conv.synced': {
+          const { conversation, messages } = data as {
+            conversation: string
+            messages: StoredMessage[]
+          }
+          if (messages.length > 0) {
+            log(`sync: ${messages.length} message(s) arrived for ${conversation}`)
+            set((s) => {
+              const loaded = s.messages[conversation]
+              return {
+                messages: loaded
+                  ? { ...s.messages, [conversation]: mergeMessages(loaded, messages) }
+                  : s.messages,
+              }
+            })
+          }
+          void get().refreshConversations()
+          break
+        }
+
+        case 'server.invite': {
+          const { id, name, from } = data as { id: string; name: string; from: string }
+          const who = get().friends.find((f) => f.id === from)
+          pushToast({
+            kind: 'server',
+            message: `${who?.persona ?? 'Someone'} invited you to ${name}`,
+            serverId: id,
+            from: who,
+          })
+          break
+        }
+
+        case 'server.call':
+          void get().refreshConversations()
           break
 
         case 'peer.joined': {
@@ -614,11 +771,16 @@ export const useStore = create<State>((set, get) => ({
       ensureMesh(info)
       // A reload during a call: rebuild the mesh from the room the daemon is
       // still in, which it will not announce again on its own.
-      if (info.room) applyRoom(info.room)
+      if (info.room) applyRoom(info.room, info.conversation ?? null)
     } catch (err) {
       // Daemon not up yet; its own `ready` event will do this instead.
       log(`app.info failed, waiting for the daemon's ready event — ${err}`)
     }
+
+    // Same reasoning as the friends list below: the daemon pushes the
+    // conversation list when something changes, and "the window just opened" is
+    // not something it can see.
+    await get().refreshConversations()
 
     // The daemon pushes the friends list once, at its own startup — which is
     // before this window exists, so that first push lands nowhere. After it the
@@ -660,6 +822,138 @@ export const useStore = create<State>((set, get) => ({
         chat: s.chat.map((m) => (m.id === id ? { ...m, delivery: 'failed' } : m)),
       }))
     }
+  },
+
+  async refreshConversations() {
+    try {
+      set({ conversations: await rpc<Conversation[]>('conv.list') })
+    } catch (err) {
+      log(`conv.list failed — ${err}`)
+    }
+  },
+
+  async selectConversation(id) {
+    set({ selected: id })
+    if (!id) return
+
+    // Load the tail once and keep it. Re-fetching on every visit would throw
+    // away the scrollback the user just paged through.
+    if (!get().messages[id]) {
+      try {
+        const page = await rpc<{ messages: StoredMessage[]; exhausted: boolean }>(
+          'conv.history',
+          { id },
+        )
+        set((s) => ({
+          messages: { ...s.messages, [id]: page.messages },
+          historyDone: { ...s.historyDone, [id]: page.exhausted },
+        }))
+      } catch (err) {
+        log(`conv.history for ${id} failed — ${err}`)
+      }
+    }
+
+    await rpc('conv.markRead', { id }).catch((err) => log(`conv.markRead failed — ${err}`))
+    await get().refreshConversations()
+  },
+
+  async loadMoreHistory(id) {
+    const loaded = get().messages[id]
+    if (!loaded || loaded.length === 0 || get().historyDone[id]) return
+    // A scroll produces a burst of events, and every one of them would ask for
+    // the same page with the same cursor.
+    if (loadingHistory.has(id)) return
+    loadingHistory.add(id)
+
+    const oldest = loaded[0]
+    const before: HistoryCursor = { at: oldest.at, author: oldest.author, seq: oldest.seq }
+    try {
+      const page = await rpc<{ messages: StoredMessage[]; exhausted: boolean }>('conv.history', {
+        id,
+        before,
+      })
+      set((s) => ({
+        messages: { ...s.messages, [id]: mergeMessages(s.messages[id] ?? [], page.messages) },
+        historyDone: { ...s.historyDone, [id]: page.exhausted },
+      }))
+    } catch (err) {
+      log(`conv.history for ${id} failed — ${err}`)
+    } finally {
+      loadingHistory.delete(id)
+    }
+  },
+
+  async createServer(name) {
+    const { id } = await rpc<{ id: string }>('servers.create', { name })
+    await get().refreshConversations()
+    await get().selectConversation(id)
+  },
+
+  async inviteToServer(conversationId, peerId) {
+    await rpc('servers.invite', { id: conversationId, to: peerId })
+  },
+
+  async leaveServer(id) {
+    await rpc('servers.leave', { id })
+    set((s) => {
+      const messages = { ...s.messages }
+      delete messages[id]
+      return { messages, selected: s.selected === id ? null : s.selected }
+    })
+    await get().refreshConversations()
+  },
+
+  async openDm(peerId) {
+    const { id } = await rpc<{ id: string }>('dm.open', { with: peerId })
+    await get().refreshConversations()
+    await get().selectConversation(id)
+  },
+
+  async sendMessage(conversationId, text) {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    try {
+      // The daemon writes it, then echoes it back as `conv.message`. No
+      // optimistic copy here, unlike the ad-hoc chat: this one is on disk
+      // before it is on the wire, so the round trip is a local write and not a
+      // network one.
+      await rpc('conv.send', { id: conversationId, text: trimmed })
+    } catch (err) {
+      log(`conv.send failed — ${err}`)
+      set((s) => ({
+        toasts: [
+          ...s.toasts,
+          { id: toastSeq++, kind: 'error', message: `Message not sent: ${err}` },
+        ],
+      }))
+    }
+  },
+
+  async startServerCall(id) {
+    const conversation = get().conversations.find((c) => c.id === id)
+    await rpc('server.call.start', { id, name: conversation?.name ?? 'Hollow' })
+  },
+
+  async joinServerCall(id) {
+    await rpc('server.call.join', { id })
+  },
+
+  async respondToServerInvite(toast, accept) {
+    get().dismissToast(toast.id)
+    if (!toast.serverId) return
+    try {
+      await rpc(accept ? 'servers.accept' : 'servers.decline', { id: toast.serverId })
+      await get().refreshConversations()
+      if (accept) await get().selectConversation(toast.serverId)
+    } catch (err) {
+      log(`server invite response failed — ${err}`)
+    }
+  },
+
+  async sendFilesTo(peerId) {
+    const paths = await window.hollow.pickFiles()
+    if (paths.length === 0) return
+    await get().sendFiles(peerId, paths)
   },
 
   async refreshFriends() {
@@ -1066,7 +1360,20 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async sendFiles(to, paths) {
-    await rpc('files.send', { to, paths })
+    try {
+      await rpc('files.send', { to, paths })
+    } catch (err) {
+      // Worth saying out loud. Outside a call this is the only feedback there
+      // is: nothing appears in the transfer strip until the other side accepts,
+      // so a silent failure looks exactly like a friend who has not answered.
+      log(`files.send to ${to} failed — ${err}`)
+      set((s) => ({
+        toasts: [
+          ...s.toasts,
+          { id: toastSeq++, kind: 'error', message: `Could not send: ${err}` },
+        ],
+      }))
+    }
   },
 
   async respondToOffer(id, accept) {

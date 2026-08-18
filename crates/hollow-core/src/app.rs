@@ -1,5 +1,6 @@
-//! Wires the RPC channel to Steam, the audio engine and file transfer.
+//! Wires the RPC channel to Steam, the audio engine, file transfer and servers.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,14 +14,17 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::files::FileTransfers;
-use crate::protocol::{FileFrame, Request, Response};
+use crate::protocol::{FileFrame, Request, Response, ServerFrame};
 use crate::rpc::Sink;
+use crate::servers::{Servers, newly_online, online_ids};
+use crate::store::{Cursor, Store};
 
 pub struct App {
     sink: Sink,
     steam: SteamService,
     audio: AudioEngine,
     files: FileTransfers,
+    servers: Servers,
     me: Peer,
     backend: BackendKind,
     backend_note: String,
@@ -28,6 +32,17 @@ pub struct App {
     app_id: u32,
     room: Option<Room>,
     presence: Presence,
+    /// The friends list as last seen, for enriching stored members with live
+    /// avatars and online state.
+    friends: Vec<Peer>,
+    /// Who was online at the last friends update, so that the next one can tell
+    /// who has just become reachable and therefore worth syncing with.
+    online: HashSet<SteamId>,
+    /// A server whose call we asked for but whose lobby Steam has not handed
+    /// back yet. Announcing has to wait for the lobby id.
+    pending_call: Option<String>,
+    /// The server whose call we are currently in, if the room belongs to one.
+    current_call: Option<String>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -41,11 +56,17 @@ impl App {
 
         let downloads = download_dir();
 
+        // A failure to open the database is fatal on purpose. Running on with
+        // history silently disabled would look identical to a working app right
+        // up to the moment someone closed it and lost the afternoon.
+        let store = Store::open(&data_dir().join("hollow.db"))?;
+
         Ok(Self {
             sink,
             steam,
             audio,
             files: FileTransfers::new(downloads),
+            servers: Servers::new(store, me.clone()),
             me,
             backend: kind,
             backend_note: note,
@@ -53,6 +74,10 @@ impl App {
             app_id,
             room: None,
             presence: Presence::default(),
+            friends: Vec::new(),
+            online: HashSet::new(),
+            pending_call: None,
+            current_call: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -123,6 +148,9 @@ impl App {
                 "audioPipe": crate::pipe::pipe_name(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "room": self.room,
+                // Which server the live call belongs to, if any. A renderer
+                // reload mid-call has no other way to find out.
+                "conversation": self.current_call,
             })),
 
             "friends.refresh" => {
@@ -282,6 +310,137 @@ impl App {
                 Ok(Value::Null)
             }
 
+            // --- servers and direct messages --------------------------------
+            "conv.list" => self.servers.list(&self.friends),
+
+            "servers.create" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or("Hollow")
+                    .trim()
+                    .to_string();
+                let id = self.servers.create(&name)?;
+                self.refresh_allowed();
+                Ok(json!({ "id": id }))
+            }
+
+            "servers.invite" => {
+                let id = conversation_id(&params)?;
+                let to = steam_id(&params, "to")?;
+                self.servers.invite(&self.steam.commands, &id, to)?;
+                Ok(Value::Null)
+            }
+
+            "servers.accept" => {
+                let id = conversation_id(&params)?;
+                self.servers
+                    .accept_invite(&self.steam.commands, &self.sink, &id)
+                    .await?;
+                self.refresh_allowed();
+                Ok(Value::Null)
+            }
+
+            "servers.decline" => {
+                let id = conversation_id(&params)?;
+                self.servers.decline_invite(&id)?;
+                Ok(Value::Null)
+            }
+
+            "servers.leave" => {
+                let id = conversation_id(&params)?;
+                self.servers.leave(&self.steam.commands, &id)?;
+                if self.current_call.as_deref() == Some(id.as_str()) {
+                    self.current_call = None;
+                }
+                self.refresh_allowed();
+                Ok(Value::Null)
+            }
+
+            "dm.open" => {
+                let with = steam_id(&params, "with")?;
+                // Prefer the live friend record: it carries the current persona,
+                // which is what the conversation will be named after.
+                let peer = self
+                    .friends
+                    .iter()
+                    .find(|f| f.id == with)
+                    .cloned()
+                    .unwrap_or_else(|| Peer::unknown(with));
+                let id = self.servers.open_dm(&peer)?;
+                self.refresh_allowed();
+                // Ask them for anything we missed while this was closed.
+                let _ = self.servers.sync_with(&self.steam.commands, with);
+                Ok(json!({ "id": id }))
+            }
+
+            "conv.history" => {
+                let id = conversation_id(&params)?;
+                let before = params
+                    .get("before")
+                    .filter(|c| !c.is_null())
+                    .map(|c| serde_json::from_value::<Cursor>(c.clone()))
+                    .transpose()
+                    .context("`before` is not a history cursor")?;
+                self.servers.history(&id, before)
+            }
+
+            "conv.send" => {
+                let id = conversation_id(&params)?;
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| anyhow!("conv.send needs a non-empty message"))?
+                    .to_string();
+                let message = self
+                    .servers
+                    .post(&self.steam.commands, &self.sink, &id, &text)
+                    .await?;
+                Ok(json!(message))
+            }
+
+            "conv.markRead" => {
+                let id = conversation_id(&params)?;
+                let at = params
+                    .get("at")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(crate::store::now_ms);
+                self.servers.mark_read(&id, at)?;
+                Ok(Value::Null)
+            }
+
+            // Starting a server call is creating a lobby and telling the server
+            // about it. The lobby id only exists once Steam answers, so the
+            // announcement waits for `RoomUpdated`.
+            "server.call.start" => {
+                let id = conversation_id(&params)?;
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Hollow")
+                    .to_string();
+                self.pending_call = Some(id);
+                self.steam.send(SteamCommand::CreateRoom {
+                    name,
+                    max_members: 6,
+                });
+                Ok(Value::Null)
+            }
+
+            "server.call.join" => {
+                let id = conversation_id(&params)?;
+                let lobby = self
+                    .servers
+                    .call(&id)
+                    .ok_or_else(|| anyhow!("there is no call running in that server"))?;
+                self.current_call = Some(id);
+                self.steam.send(SteamCommand::JoinRoom { id: lobby });
+                Ok(Value::Null)
+            }
+
             other => Err(anyhow!("unknown method: {other}")),
         }
     }
@@ -290,22 +449,73 @@ impl App {
         match evt {
             SteamEvent::Ready { me, backend } => {
                 self.me = me.clone();
+                self.servers.set_me(me.clone());
                 self.backend = backend;
+                // Open the gate to everyone we already share a server with, so
+                // that history starts reconciling before anyone touches the UI.
+                self.refresh_allowed();
                 self.sink
                     .emit("identity", json!({ "me": me, "backend": backend }))
                     .await;
             }
 
             SteamEvent::FriendsUpdated(friends) => {
+                // Someone becoming reachable is the only moment asking them for
+                // the backlog can work, so the diff drives the sync.
+                let arrived = newly_online(&self.online, &friends);
+                self.online = online_ids(&friends);
+                self.friends = friends.clone();
+                self.refresh_allowed();
+
+                for peer in arrived {
+                    if let Err(err) = self.servers.sync_with(&self.steam.commands, peer) {
+                        tracing::warn!("sync with {peer} failed: {err}");
+                    }
+                }
+
                 self.sink.emit("friends", json!(friends)).await;
+                self.emit_conversations().await;
             }
 
             SteamEvent::RoomUpdated(room) => {
+                // The lobby we were waiting on to be able to tell a server where
+                // its call is.
+                if let Some(conversation) = self.pending_call.take() {
+                    let _ =
+                        self.servers
+                            .announce_call(&self.steam.commands, &conversation, Some(room.id));
+                    self.current_call = Some(conversation);
+                    self.emit_conversations().await;
+                } else if self.current_call.is_none() {
+                    // Joined through a Steam invite rather than through the
+                    // server list: the lobby may still belong to a server, and
+                    // the chat panel needs to know which one.
+                    self.current_call = self.servers.conversation_for_lobby(room.id);
+                }
+
                 self.room = Some(room.clone());
-                self.sink.emit("room", json!(room)).await;
+                self.sink
+                    .emit(
+                        "room",
+                        json!({ "room": room, "conversation": self.current_call }),
+                    )
+                    .await;
             }
 
             SteamEvent::RoomLeft => {
+                // Only the last one out turns the light off. Anyone else leaving
+                // says nothing, because the call is still running for the people
+                // still in it.
+                let was_alone = self.room.as_ref().is_none_or(|r| r.members.len() <= 1);
+                if let Some(conversation) = self.current_call.take() {
+                    if was_alone {
+                        let _ =
+                            self.servers
+                                .announce_call(&self.steam.commands, &conversation, None);
+                    }
+                    self.emit_conversations().await;
+                }
+
                 self.room = None;
                 self.audio.send(MixerCommand::Stop);
                 self.sink.emit("room", Value::Null).await;
@@ -365,6 +575,16 @@ impl App {
                         .handle(&self.steam.commands, &self.sink, from, frame)
                         .await?;
                 }
+                Channel::Servers => {
+                    let frame: ServerFrame = serde_json::from_slice(&payload)
+                        .context("server frame was not JSON")?;
+                    self.servers
+                        .handle(&self.steam.commands, &self.sink, from, frame)
+                        .await?;
+                    // Membership may have moved, and the gate is what lets the
+                    // people behind it reach us at all.
+                    self.refresh_allowed();
+                }
                 // Presence arrives pre-parsed as PresenceChanged; anything else
                 // on the control channel is not ours.
                 Channel::Control => {}
@@ -412,6 +632,37 @@ impl App {
     }
 }
 
+impl App {
+    /// Tell Steam who may reach us while no call is running.
+    ///
+    /// Friends plus everyone we share a conversation with. Recomputed rather
+    /// than accumulated, so unfriending someone or leaving the last server you
+    /// shared actually closes the door again — see `SetAllowedPeers`.
+    fn refresh_allowed(&self) {
+        let mut allowed: HashSet<SteamId> = self.friends.iter().map(|f| f.id).collect();
+        match self.servers.known_peers() {
+            Ok(peers) => allowed.extend(peers),
+            Err(err) => tracing::warn!("could not read known peers: {err}"),
+        }
+        allowed.remove(&self.me.id);
+        self.steam
+            .send(SteamCommand::SetAllowedPeers(allowed.into_iter().collect()));
+    }
+
+    /// Push the whole conversation list.
+    ///
+    /// Whole rather than incremental, in the same spirit as the friends list:
+    /// unread counts, live call state and online members all move for reasons
+    /// that have nothing to do with each other, and a handful of rows is far
+    /// cheaper to re-send than to reconcile.
+    async fn emit_conversations(&self) {
+        match self.servers.list(&self.friends) {
+            Ok(list) => self.sink.emit("conversations", list).await,
+            Err(err) => tracing::warn!("could not list conversations: {err}"),
+        }
+    }
+}
+
 /// Forward a crossbeam receiver onto a tokio channel.
 ///
 /// The producer threads are synchronous by necessity (COM apartments, Steam
@@ -428,6 +679,15 @@ fn bridge<T: Send + 'static>(rx: crossbeam_channel::Receiver<T>) -> mpsc::Unboun
     out
 }
 
+fn conversation_id(params: &Value) -> Result<String> {
+    params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("expected `id` as a conversation id"))
+}
+
 fn steam_id(params: &Value, key: &str) -> Result<SteamId> {
     let raw = params
         .get(key)
@@ -435,6 +695,17 @@ fn steam_id(params: &Value, key: &str) -> Result<SteamId> {
         .ok_or_else(|| anyhow!("expected `{key}` as a string SteamID64"))?;
     raw.parse::<SteamId>()
         .map_err(|_| anyhow!("`{key}` is not a valid SteamID64: {raw}"))
+}
+
+/// Where Hollow keeps what has to outlive a session: the database, and nothing
+/// else so far.
+///
+/// Roaming app data rather than beside the executable, so that an install for
+/// all users, a portable copy and an upgrade all find the same history.
+fn data_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "Hollow")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("Hollow"))
 }
 
 /// Where received files land: the user's Downloads folder, under `Hollow`.
