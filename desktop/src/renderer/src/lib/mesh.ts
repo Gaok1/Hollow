@@ -137,6 +137,24 @@ export interface LinkHealth {
   quality: LinkQuality
 }
 
+/**
+ * A local description as plain data, ready to be sent.
+ *
+ * This is not a formality. `RTCSessionDescription` keeps `type` and `sdp` on its
+ * prototype rather than as own properties, and Electron's IPC — which every
+ * signaling message crosses on its way to the daemon — turns an object it does
+ * not recognise into `{}` and raises nothing at all. The offer left here
+ * looking sent, arrived as an empty object, and the far end could only say
+ * "Failed to parse SessionDescription" about an SDP that was never in it.
+ *
+ * That is why no call ever carried media while ICE candidates crossed fine:
+ * candidates were already being flattened with `toJSON`, descriptions were not.
+ * Copying the two fields by hand says exactly what goes on the wire.
+ */
+function describe(description: RTCSessionDescription | null): RTCSessionDescriptionInit | null {
+  return description && { type: description.type, sdp: description.sdp }
+}
+
 export interface MeshEvents {
   /** A remote track arrived or was replaced. `track` is null when it stopped. */
   onTrack(peerId: string, slot: TrackSlot, track: MediaStreamTrack | null): void
@@ -258,6 +276,19 @@ export class Mesh {
       candidate?: RTCIceCandidateInit
     }
 
+    // A description that lost its SDP on the way here parses as nothing, and
+    // Chromium's complaint about it names neither the peer nor the reason. Say
+    // both, before handing it over.
+    if (message.kind === 'offer' || message.kind === 'answer') {
+      if (typeof message.sdp?.sdp !== 'string' || message.sdp.sdp.length === 0) {
+        this.events.log(
+          `link ${peerId}: ${message.kind} arrived with no SDP in it ` +
+            `(${JSON.stringify(message.sdp)}) — it was lost in transit, not malformed`,
+        )
+        return
+      }
+    }
+
     let link = this.links.get(peerId)
     if (!link) {
       // An offer can beat the room update that tells us this peer exists.
@@ -280,7 +311,7 @@ export class Mesh {
           await this.flushCandidates(link)
           const answer = await link.pc.createAnswer()
           await this.setLocalTuned(link, answer)
-          this.events.send(peerId, { kind: 'answer', sdp: link.pc.localDescription })
+          this.events.send(peerId, { kind: 'answer', sdp: describe(link.pc.localDescription) })
           link.health.negotiated = true
           this.report(peerId, link)
           this.events.log(`link ${peerId}: answered their offer`)
@@ -577,7 +608,7 @@ export class Mesh {
     try {
       const offer = await link.pc.createOffer()
       await this.setLocalTuned(link, offer)
-      this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.events.send(peerId, { kind: 'offer', sdp: describe(link.pc.localDescription) })
       this.events.log(`link ${peerId}: offer sent`)
       this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
@@ -609,7 +640,7 @@ export class Mesh {
       link.health.unansweredOffers = attempt
       this.report(peerId, link)
       this.events.log(`link ${peerId}: no answer, re-sending offer (${attempt})`)
-      this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.events.send(peerId, { kind: 'offer', sdp: describe(link.pc.localDescription) })
       this.scheduleOfferRetry(peerId, link, attempt + 1)
     }, delay)
   }
@@ -619,7 +650,7 @@ export class Mesh {
     try {
       const offer = await link.pc.createOffer({ iceRestart: true })
       await this.setLocalTuned(link, offer)
-      this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.events.send(peerId, { kind: 'offer', sdp: describe(link.pc.localDescription) })
       this.events.log(`link ${peerId}: ICE restart offered`)
       this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
@@ -759,7 +790,10 @@ function tuneOpus(sdp: string | undefined): string | undefined {
   const payload = /^a=rtpmap:(\d+) opus\/48000\/2/im.exec(sdp)?.[1]
   if (!payload) return sdp
 
-  const fmtp = new RegExp(`^a=fmtp:${payload} (.*)$`, 'im')
+  // Matched up to the line terminator rather than with `$`, which in multiline
+  // mode sits after the `\r` of a CRLF and would drag it into the capture — and
+  // then drop it, leaving one line of the SDP ending differently from the rest.
+  const fmtp = new RegExp(`^a=fmtp:${payload} ([^\\r\\n]*)`, 'im')
   const existing = fmtp.exec(sdp)
 
   const params = new Map<string, string>()
@@ -778,7 +812,7 @@ function tuneOpus(sdp: string | undefined): string | undefined {
 
   if (existing) return sdp.replace(fmtp, line)
   return sdp.replace(
-    new RegExp(`^(a=rtpmap:${payload} opus/48000/2)$`, 'im'),
-    `$1\r\n${line}`,
+    new RegExp(`^a=rtpmap:${payload} opus/48000/2[^\\r\\n]*`, 'im'),
+    `$&\r\n${line}`,
   )
 }
