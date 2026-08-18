@@ -59,9 +59,8 @@ function createWindow(): void {
     window = null
   })
 
-  for (const event of ['maximize', 'unmaximize'] as const) {
-    window.on(event, () => window?.webContents.send('window:state', event === 'maximize'))
-  }
+  window.on('maximize', () => window?.webContents.send('window:state', true))
+  window.on('unmaximize', () => window?.webContents.send('window:state', false))
 }
 
 function configureSession(): void {
