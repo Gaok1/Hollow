@@ -298,6 +298,33 @@ impl SteamRealBackend {
         out.push(SteamEvent::RoomUpdated(room));
     }
 
+    /// Whether a peer is entitled to talk to us, which means: is it in our lobby.
+    ///
+    /// The cached set is what the session-request callback sees, and it only
+    /// refreshes when membership churn is noticed. A joiner's very first offer
+    /// can beat that notice — it learned the full member list the moment it
+    /// entered, while our own update is still in flight. Dropping that offer
+    /// costs a call that never connects and never says why, so ask Steam
+    /// directly before rejecting anyone.
+    fn is_room_member(&self, raw: u64) -> bool {
+        if self.allowed.lock().contains(&raw) {
+            return true;
+        }
+        let Some(room) = self.room.as_ref() else {
+            return false;
+        };
+        let member = self
+            .client
+            .matchmaking()
+            .lobby_members(LobbyId::from_raw(room.id.raw()))
+            .iter()
+            .any(|s| s.raw() == raw);
+        if member {
+            self.allowed.lock().insert(raw);
+        }
+        member
+    }
+
     fn drain_channel(&mut self, channel: Channel, out: &mut Vec<SteamEvent>) {
         let messages = self
             .client
@@ -309,7 +336,7 @@ impl SteamRealBackend {
                 continue;
             };
             let raw = from.raw();
-            if !self.allowed.lock().contains(&raw) {
+            if !self.is_room_member(raw) {
                 continue;
             }
             let payload = msg.data().to_vec();
@@ -566,6 +593,16 @@ impl SteamBackend for SteamRealBackend {
             self.drain_channel(channel, out);
         }
 
+        // Membership churn arrives as a callback, but the session-request
+        // callback only ever sees the cached `allowed` set — so a peer that
+        // knocks before that callback lands gets refused. Reconciling on a
+        // short interval keeps the window down to tens of milliseconds; the
+        // call is a local lookup in the Steam client and returns early when
+        // nothing moved.
+        if self.ticks % 8 == 0 {
+            self.reconcile_room(out);
+        }
+
         // Friend state and avatars settle asynchronously after startup, so poll
         // about twice a second rather than on every 8ms tick.
         if self.ticks % 64 == 0 {
@@ -584,7 +621,6 @@ impl SteamBackend for SteamRealBackend {
             if self.me.avatar.is_none() {
                 self.me.avatar = self.avatar_for(self.me.id.raw());
             }
-            self.reconcile_room(out);
         }
     }
 }

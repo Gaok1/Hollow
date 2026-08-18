@@ -194,6 +194,39 @@ export const useStore = create<State>((set, get) => ({
       )
     }
 
+    /**
+     * Reconcile the mesh with a room snapshot.
+     *
+     * Shared between the `room` event and the `app.info` fallback: a renderer
+     * reload mid-call gets its room from the latter, and the daemon will not
+     * re-emit the event until membership actually churns.
+     */
+    const applyRoom = (room: Room | null) => {
+      const previous = get().room
+      set({ room })
+
+      if (!room) {
+        mesh?.closeAll()
+        set({ remoteTracks: {}, connection: {}, presence: {}, pinned: null })
+        void get().stopShare()
+        return
+      }
+
+      // Open a connection to everyone we are not already talking to, and drop
+      // anyone who left. Room updates are authoritative; the join and leave
+      // events are just faster.
+      const me = get().me?.id
+      const wanted = new Set(room.members.map((m) => m.id).filter((id) => id !== me))
+      for (const id of wanted) void mesh?.connect(id)
+      for (const id of mesh?.peerIds ?? []) {
+        if (!wanted.has(id)) mesh?.disconnect(id)
+      }
+      if (!previous) {
+        // Publish our starting state so late tiles are not blank.
+        void rpc('presence.set', get().localPresence)
+      }
+    }
+
     const pushToast = (toast: Omit<Toast, 'id'>) => {
       const id = toastSeq++
       set((s) => ({ toasts: [...s.toasts, { ...toast, id }] }))
@@ -221,33 +254,9 @@ export const useStore = create<State>((set, get) => ({
           set({ friends: data as Peer[] })
           break
 
-        case 'room': {
-          const room = data as Room | null
-          const previous = get().room
-          set({ room })
-
-          if (!room) {
-            mesh?.closeAll()
-            set({ remoteTracks: {}, connection: {}, presence: {}, pinned: null })
-            void get().stopShare()
-            break
-          }
-
-          // Open a connection to everyone we are not already talking to, and
-          // drop anyone who left. Room updates are authoritative; the join and
-          // leave events are just faster.
-          const me = get().me?.id
-          const wanted = new Set(room.members.map((m) => m.id).filter((id) => id !== me))
-          for (const id of wanted) void mesh?.connect(id)
-          for (const id of mesh?.peerIds ?? []) {
-            if (!wanted.has(id)) mesh?.disconnect(id)
-          }
-          if (!previous) {
-            // Publish our starting state so late tiles are not blank.
-            void rpc('presence.set', get().localPresence)
-          }
+        case 'room':
+          applyRoom(data as Room | null)
           break
-        }
 
         case 'peer.joined': {
           const peer = data as Peer
@@ -351,6 +360,9 @@ export const useStore = create<State>((set, get) => ({
       const info = await rpc<AppInfo>('app.info')
       set({ info, me: info.me })
       ensureMesh(info)
+      // A reload during a call: rebuild the mesh from the room the daemon is
+      // still in, which it will not announce again on its own.
+      if (info.room) applyRoom(info.room)
     } catch {
       // Daemon not up yet; its own `ready` event will do this instead.
     }

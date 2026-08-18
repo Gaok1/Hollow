@@ -89,6 +89,12 @@ function configureSession(): void {
   ses.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(permission === 'media')
   })
+
+  // Chromium asks this one synchronously, on a different path from the request
+  // above: it gates device labels in `enumerateDevices` and the capture check
+  // `getUserMedia` runs before it ever prompts. Left at Electron's default the
+  // settings dropdowns come back as blank entries with no names.
+  ses.setPermissionCheckHandler((_wc, permission) => permission === 'media')
 }
 
 app.whenReady().then(() => {

@@ -49,6 +49,15 @@ const SCREEN_FLOOR_BPS = 900_000
 const CAMERA_BUDGET_BPS = 2_400_000
 const CAMERA_FLOOR_BPS = 200_000
 
+/**
+ * Signaling rides Steam's P2P messaging, which drops anything sent before the
+ * remote side has accepted the session — and it accepts only once it has seen
+ * us join the lobby, which is a race it can lose. A dropped offer is a call
+ * that never connects and never explains why, so re-send until an answer lands.
+ */
+const OFFER_RETRY_MS = 1_500
+const OFFER_RETRIES = 6
+
 export interface MeshEvents {
   /** A remote track arrived or was replaced. `track` is null when it stopped. */
   onTrack(peerId: string, slot: TrackSlot, track: MediaStreamTrack | null): void
@@ -64,6 +73,8 @@ interface Link {
   /** Candidates that arrived before the remote description was set. */
   earlyCandidates: RTCIceCandidateInit[]
   remoteDescriptionSet: boolean
+  /** Pending offer re-send, cleared once an answer arrives. */
+  offerRetry: ReturnType<typeof setTimeout> | null
 }
 
 export class Mesh {
@@ -105,6 +116,7 @@ export class Mesh {
     const link = this.links.get(peerId)
     if (!link) return
     this.links.delete(peerId)
+    if (link.offerRetry) clearTimeout(link.offerRetry)
     link.pc.close()
     for (const { slot } of LAYOUT) this.events.onTrack(peerId, slot, null)
     this.retuneBitrates()
@@ -171,6 +183,10 @@ export class Mesh {
           if (!message.sdp || link.pc.signalingState !== 'have-local-offer') return
           await link.pc.setRemoteDescription(message.sdp)
           link.remoteDescriptionSet = true
+          if (link.offerRetry) {
+            clearTimeout(link.offerRetry)
+            link.offerRetry = null
+          }
           await this.flushCandidates(link)
           break
         }
@@ -236,7 +252,13 @@ export class Mesh {
       pc.addTransceiver(kind, { direction: 'sendrecv' }),
     )
 
-    const link: Link = { pc, transceivers, earlyCandidates: [], remoteDescriptionSet: false }
+    const link: Link = {
+      pc,
+      transceivers,
+      earlyCandidates: [],
+      remoteDescriptionSet: false,
+      offerRetry: null,
+    }
 
     // Attach whatever is already live locally.
     for (const [index, { slot }] of LAYOUT.entries()) {
@@ -251,14 +273,25 @@ export class Mesh {
     }
 
     pc.ontrack = (event) => {
-      const index = pc.getTransceivers().indexOf(event.transceiver)
+      const index = link.transceivers.indexOf(event.transceiver)
       const slot = LAYOUT[index]?.slot
       if (!slot) return
 
-      this.events.onTrack(peerId, slot, event.track)
-      // A remote `replaceTrack(null)` surfaces as the track muting, not as a
-      // new track event, so the tile has to watch the track itself.
-      event.track.onended = () => this.events.onTrack(peerId, slot, null)
+      // Because the whole layout is negotiated up front, a receiver track
+      // exists for every slot from the first answer — long before the peer
+      // publishes anything into it. `muted` is the flag that actually says
+      // whether media is flowing: it clears when the first packet arrives and
+      // comes back when the sender calls `replaceTrack(null)`.
+      //
+      // Reporting the bare track instead would put a permanently black video
+      // in every tile, and leave the last frame of a camera or a screen share
+      // frozen on screen after it was turned off.
+      const track = event.track
+      const publish = () => this.events.onTrack(peerId, slot, track.muted ? null : track)
+      track.onunmute = publish
+      track.onmute = publish
+      track.onended = () => this.events.onTrack(peerId, slot, null)
+      publish()
     }
 
     pc.onconnectionstatechange = () => {
@@ -278,9 +311,37 @@ export class Mesh {
       const offer = await link.pc.createOffer()
       await link.pc.setLocalDescription(offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
       console.error(`could not offer to ${peerId}`, err)
     }
+  }
+
+  /**
+   * Re-send the current offer while no answer has come back.
+   *
+   * `have-local-offer` is exactly the state that means "the peer never replied":
+   * either the offer or the answer was lost on the way. Re-sending the same
+   * description is idempotent for the peer — it just answers again — and the
+   * retry also forces Steam to open a fresh P2P session if the first attempt
+   * was refused because the peer had not seen us join yet.
+   */
+  private scheduleOfferRetry(peerId: string, link: Link, attempt: number): void {
+    if (link.offerRetry) clearTimeout(link.offerRetry)
+    if (attempt > OFFER_RETRIES) {
+      link.offerRetry = null
+      return
+    }
+
+    link.offerRetry = setTimeout(() => {
+      link.offerRetry = null
+      if (this.links.get(peerId) !== link) return
+      if (link.pc.signalingState !== 'have-local-offer') return
+
+      console.warn(`no answer from ${peerId}; re-sending offer (${attempt})`)
+      this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.scheduleOfferRetry(peerId, link, attempt + 1)
+    }, OFFER_RETRY_MS)
   }
 
   private async restartIce(peerId: string, link: Link): Promise<void> {
@@ -289,6 +350,7 @@ export class Mesh {
       const offer = await link.pc.createOffer({ iceRestart: true })
       await link.pc.setLocalDescription(offer)
       this.events.send(peerId, { kind: 'offer', sdp: link.pc.localDescription })
+      this.scheduleOfferRetry(peerId, link, 1)
     } catch (err) {
       console.error(`ICE restart for ${peerId} failed`, err)
     }

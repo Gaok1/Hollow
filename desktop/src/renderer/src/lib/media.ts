@@ -122,9 +122,11 @@ export async function openScreen(
       audio: withSystemAudio,
     })
   } catch (error) {
-    if (!withSystemAudio || !(error instanceof DOMException) || error.name !== 'NotReadableError') {
-      throw error
-    }
+    // Loopback capture fails in more ways than one — a busy exclusive-mode
+    // endpoint raises NotReadableError, a missing render device InvalidState,
+    // some driver stacks NotAllowedError. None of them are a reason to refuse
+    // to share the screen, which is what the user actually asked for.
+    if (!withSystemAudio) throw error
     console.warn('System audio capture failed; sharing video without audio', error)
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: videoConstraints,

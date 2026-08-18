@@ -71,6 +71,8 @@ export interface AppInfo {
   audioPipe: string
   downloadDir: string
   version: string
+  /** The call already in progress, when the renderer reloads mid-call. */
+  room?: Room | null
 }
 
 export interface ScreenSource {
