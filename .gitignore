@@ -1,2 +1,12 @@
 target/
 received/
+
+# Electron shell
+desktop/node_modules/
+desktop/out/
+desktop/dist/
+
+# Valve's redistributable, emitted into target/ by steamworks-sys.
+steam_api64.dll
+
+*.log

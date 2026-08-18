@@ -1,0 +1,27 @@
+[package]
+name = "hollow-steam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Steam-backed identity, presence, rooms and peer signaling for Hollow"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+# Steam hands out avatars as raw RGBA; the UI wants a data: URL.
+png = "0.17"
+base64 = "0.22"
+
+# `steamworks-sys` vendors the whole Steamworks SDK — headers and the
+# redistributable `steam_api64.dll` — so there is nothing to download and no
+# environment variable to set. All an end user needs is the Steam client.
+steamworks = "0.13"
+# For `InviteUserToLobby`, which the safe wrapper does not expose. See
+# `real.rs`: the overlay-based alternative only works for apps launched by
+# Steam, which Hollow is not.
+steamworks-sys = "0.13"

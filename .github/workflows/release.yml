@@ -25,28 +25,25 @@ jobs:
             echo "No version tag in commit message, skipping release."
           fi
 
+  # Hollow is Windows-only: the audio engine is built directly on WASAPI and
+  # the shipped artefact is an NSIS installer.
   build:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: Hollow
-            asset_name: Hollow-linux-x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: Hollow.exe
-            asset_name: Hollow-windows-x86_64.exe
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -55,22 +52,31 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cargo-
 
-      - name: Build (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release --target ${{ matrix.target }}
+      # `steamworks-sys` vendors the SDK, so there is nothing for CI to fetch
+      # and the released binary is a full Steam build.
+      - name: Build daemon
+        run: cargo build --release --bin hollow-core
 
-      - name: Build (Windows)
-        if: matrix.os == 'windows-latest'
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: desktop
+        run: npm run typecheck
+
+      - name: Build installer
+        working-directory: desktop
+        run: npm run dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          name: Hollow-windows-x86_64
+          path: desktop/dist/*.exe
 
   release:
     needs: [check-version, build]
@@ -78,32 +84,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Prepare release assets
-        run: |
-          mkdir release
-          cp artifacts/Hollow-linux-x86_64/Hollow        release/Hollow-linux-x86_64
-          cp artifacts/Hollow-windows-x86_64.exe/Hollow.exe release/Hollow-windows-x86_64.exe
-          chmod +x release/Hollow-linux-x86_64
-
-      - name: Create GitHub Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
-          name: ${{ needs.check-version.outputs.version }}
-          body: |
-            ## Hollow ${{ needs.check-version.outputs.version }}
-
-            **Downloads:**
-            - `Hollow-linux-x86_64` — Linux x86_64
-            - `Hollow-windows-x86_64.exe` — Windows x86_64
-
-            **Commit:** ${{ github.event.head_commit.message }}
-          files: |
-            release/Hollow-linux-x86_64
-            release/Hollow-windows-x86_64.exe
-          fail_on_unmatched_files: true
+          name: Hollow ${{ needs.check-version.outputs.version }}
+          files: artifacts/**/*.exe
+          generate_release_notes: true

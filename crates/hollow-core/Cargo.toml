@@ -1,0 +1,26 @@
+[package]
+name = "hollow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hollow's headless daemon: Steam connectivity, audio mixing and file transfer"
+
+[[bin]]
+name = "hollow-core"
+path = "src/main.rs"
+
+[dependencies]
+hollow-steam = { path = "../hollow-steam" }
+hollow-audio = { path = "../hollow-audio" }
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+base64 = "0.22"
+directories = "5.0"

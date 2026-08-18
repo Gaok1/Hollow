@@ -1,0 +1,47 @@
+appId: dev.hollow.app
+productName: Hollow
+copyright: Copyright © Luis Phillip Lemos Martins
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+
+# The daemon ships beside the app and is spawned as a child process.
+#
+# `steam_api64.dll` is Valve's redistributable, vendored by `steamworks-sys` and
+# emitted into the cargo target directory. It must sit next to hollow-core.exe
+# or the daemon will not start.
+#
+# `steam_appid.txt` lets Steam identify the app: Hollow is launched from the
+# desktop rather than by Steam, so there is no launch environment to read it
+# from.
+extraResources:
+  - from: ../target/release/hollow-core.exe
+    to: hollow-core.exe
+  - from: ../target/release/steam_api64.dll
+    to: steam_api64.dll
+  - from: build/steam_appid.txt
+    to: steam_appid.txt
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/hollow.ico
+  # Hollow makes only outbound connections; no elevation is needed.
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: Hollow
+
+# Windows-only for now: the audio mixer is built on WASAPI and has no
+# cross-platform equivalent.
+publish: null
