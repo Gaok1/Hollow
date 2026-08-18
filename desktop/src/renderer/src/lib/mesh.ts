@@ -155,6 +155,17 @@ function describe(description: RTCSessionDescription | null): RTCSessionDescript
   return description && { type: description.type, sdp: description.sdp }
 }
 
+/**
+ * The mids of an SDP's m-sections, in the order the m-lines appear.
+ *
+ * `a=mid:` occurs once per media section and nowhere else, so reading them in
+ * order is the same as walking the m-lines — and the order is LAYOUT's, because
+ * the offering side created the transceivers in it.
+ */
+function midsOf(sdp: string): string[] {
+  return [...sdp.matchAll(/^a=mid:(\S+)/gm)].map((match) => match[1])
+}
+
 export interface MeshEvents {
   /** A remote track arrived or was replaced. `track` is null when it stopped. */
   onTrack(peerId: string, slot: TrackSlot, track: MediaStreamTrack | null): void
@@ -168,8 +179,22 @@ export interface MeshEvents {
 
 interface Link {
   pc: RTCPeerConnection
-  /** Transceivers in LAYOUT order; index matches. */
+  /**
+   * Transceivers in LAYOUT order; index matches.
+   *
+   * Empty on the answering side until its first offer arrives: the ones it
+   * would make itself are not the ones the media comes in on. See
+   * `adoptTransceivers`.
+   */
   transceivers: RTCRtpTransceiver[]
+  /**
+   * Which slot each m-line carries, keyed by mid.
+   *
+   * The mid is the only name for an m-line that both ends agree on, and on the
+   * answering side it is the only one available at all: a track arrives on a
+   * transceiver this side never created, so there is no index to look it up by.
+   */
+  slotByMid: Map<string, TrackSlot>
   /** Candidates that arrived before the remote description was set. */
   earlyCandidates: RTCIceCandidateInit[]
   remoteDescriptionSet: boolean
@@ -210,11 +235,10 @@ export class Mesh {
   async connect(peerId: string): Promise<void> {
     if (this.links.has(peerId) || peerId === this.selfId) return
 
-    const link = this.createLink(peerId)
+    const role = this.isOfferer(peerId) ? 'offerer' : 'answerer'
+    const link = this.createLink(peerId, role)
     this.links.set(peerId, link)
-    this.events.log(
-      `link ${peerId}: opened as ${this.isOfferer(peerId) ? 'offerer' : 'answerer'}`,
-    )
+    this.events.log(`link ${peerId}: opened as ${role}`)
 
     if (this.isOfferer(peerId)) {
       await this.sendOffer(peerId, link)
@@ -296,7 +320,7 @@ export class Mesh {
         this.events.log(`link ${peerId}: dropped a ${message.kind} for an unknown peer`)
         return
       }
-      link = this.createLink(peerId)
+      link = this.createLink(peerId, 'answerer')
       this.links.set(peerId, link)
       this.events.log(`link ${peerId}: opened by their offer`)
       this.startSampling()
@@ -306,7 +330,11 @@ export class Mesh {
       switch (message.kind) {
         case 'offer': {
           if (!message.sdp) return
+          // Before applying it: `ontrack` fires inside `setRemoteDescription`
+          // and cannot name a slot without this.
+          this.bindSlots(peerId, link, message.sdp.sdp)
           await link.pc.setRemoteDescription(message.sdp)
+          this.adoptTransceivers(peerId, link, message.sdp.sdp)
           link.remoteDescriptionSet = true
           await this.flushCandidates(link)
           const answer = await link.pc.createAnswer()
@@ -382,6 +410,9 @@ export class Mesh {
     if (this.links.get(peerId) !== link) return
 
     const candidates = new Map<string, { candidateType?: string }>()
+    // Per m-line, because the whole point is to tell a slot carrying media from
+    // one that is only carrying congestion control's padding.
+    const bytesByMid = new Map<string, number>()
     let pair: Record<string, number | string | boolean | undefined> | null = null
     let bytesSent = 0
     let bytesReceived = 0
@@ -405,6 +436,7 @@ export class Mesh {
           break
         case 'inbound-rtp':
           bytesReceived += stat.bytesReceived ?? 0
+          if (typeof stat.mid === 'string') bytesByMid.set(stat.mid, stat.bytesReceived ?? 0)
           break
         case 'remote-inbound-rtp':
           // Reported by the far end: what it did not get from us.
@@ -447,11 +479,132 @@ export class Mesh {
       route,
     }
     link.lastSample = { at: now, bytesSent, bytesReceived }
+    this.settleLive(peerId, link, bytesByMid)
     this.report(peerId, link)
   }
 
 
-  private createLink(peerId: string): Link {
+  /** Point every sender at whatever its slot is carrying locally. */
+  private attachLocal(link: Link): void {
+    for (const [index, { slot }] of LAYOUT.entries()) {
+      const sender = link.transceivers[index]?.sender
+      const track = this.local[slot] ?? null
+      if (!sender || sender.track === track) continue
+      void sender.replaceTrack(track)
+    }
+  }
+
+  /**
+   * Record which slot each m-line of an offer carries.
+   *
+   * Both ends read this off the same offer — the offering side from the
+   * description it just set, the answering side from the one that arrived — so
+   * both end up with the same map. The answering side has to fill it *before*
+   * applying the offer, because `ontrack` fires inside `setRemoteDescription`
+   * and has nothing else to go on.
+   */
+  private bindSlots(peerId: string, link: Link, sdp: string | undefined): void {
+    if (!sdp) return
+    const mids = midsOf(sdp)
+    if (mids.length !== LAYOUT.length) {
+      this.events.log(
+        `link ${peerId}: an offer with ${mids.length} m-lines, expected ${LAYOUT.length}` +
+          ` — the peer is probably running a different version`,
+      )
+    }
+    mids.forEach((mid, index) => {
+      const slot = LAYOUT[index]?.slot
+      if (slot) link.slotByMid.set(mid, slot)
+    })
+  }
+
+  /**
+   * Take the transceivers the offer brought and put them in LAYOUT order.
+   *
+   * Answering an offer creates one transceiver per m-line, and those are the
+   * ones the media rides on. Ours are not: see `createLink`. Adopting them by
+   * mid keeps every index-based path — bitrates, publishing, liveness — working
+   * unchanged on both sides of a call.
+   */
+  private adoptTransceivers(peerId: string, link: Link, sdp: string | undefined): void {
+    if (!sdp) return
+    const byMid = new Map<string | null, RTCRtpTransceiver>(
+      link.pc.getTransceivers().map((transceiver) => [transceiver.mid, transceiver]),
+    )
+    const mids = midsOf(sdp)
+    const adopted: RTCRtpTransceiver[] = []
+
+    for (const [index, { slot }] of LAYOUT.entries()) {
+      const transceiver = byMid.get(mids[index] ?? null)
+      if (!transceiver) {
+        this.events.log(`link ${peerId}: their offer has no m-line for ${slot}`)
+        continue
+      }
+      // A transceiver created from a remote offer answers `recvonly` unless it
+      // is told otherwise, and then nothing this side publishes is ever sent.
+      transceiver.direction = 'sendrecv'
+      adopted[index] = transceiver
+    }
+
+    link.transceivers = adopted
+    this.attachLocal(link)
+  }
+
+  /** Move one slot in or out of the live set, and say so once. */
+  private setLive(
+    peerId: string,
+    link: Link,
+    slot: TrackSlot,
+    flowing: boolean,
+    track: MediaStreamTrack | null,
+  ): void {
+    if (flowing === link.live.has(slot)) return
+    if (flowing) link.live.add(slot)
+    else link.live.delete(slot)
+    link.health.receiving = [...link.live]
+    this.events.onTrack(peerId, slot, flowing ? track : null)
+    this.events.log(`link ${peerId}: ${slot} ${flowing ? 'is live' : 'went quiet'}`)
+    this.report(peerId, link)
+  }
+
+  /**
+   * Decide which slots are really carrying media, from bytes rather than flags.
+   *
+   * A receiver's `muted` is not the whole truth. An audio one clears the moment
+   * the transport is up, whether or not the peer ever published into that slot,
+   * and a video one clears for the padding packets congestion control sends to
+   * measure the link — packets with no payload in them at all. Believing either
+   * puts an empty tile on screen for a camera nobody turned on.
+   *
+   * Bytes received are cumulative, so this never takes a slot away for going
+   * quiet: a screen share of a still window can send almost nothing for a long
+   * time and is very much still live.
+   */
+  private settleLive(peerId: string, link: Link, bytesByMid: Map<string, number>): void {
+    for (const [index, { slot }] of LAYOUT.entries()) {
+      const transceiver = link.transceivers[index]
+      if (!transceiver || transceiver.mid === null) continue
+      const track = transceiver.receiver.track
+      const flowing =
+        track.readyState === 'live' &&
+        !track.muted &&
+        (bytesByMid.get(transceiver.mid) ?? 0) > 0
+      this.setLive(peerId, link, slot, flowing, track)
+    }
+  }
+
+  /**
+   * Build a connection for a peer.
+   *
+   * Only the offering side lays out the transceivers. An answerer that creates
+   * its own gets nothing for them: Chromium does not associate transceivers it
+   * did not create itself with the m-lines of an incoming offer — it makes new
+   * ones and leaves ours with a null mid, in no m-line at all. Everything that
+   * side publishes then goes to senders that are in no m-line either, so it is
+   * heard by nobody, and every arriving track lands on a transceiver we cannot
+   * name. `adoptTransceivers` takes the offer's instead.
+   */
+  private createLink(peerId: string, role: 'offerer' | 'answerer'): Link {
     const pc = new RTCPeerConnection({
       iceServers: this.iceServers,
       // One transport for everything; separate ones would mean separate ICE
@@ -460,13 +613,15 @@ export class Mesh {
       rtcpMuxPolicy: 'require',
     })
 
-    const transceivers = LAYOUT.map(({ kind }) =>
-      pc.addTransceiver(kind, { direction: 'sendrecv' }),
-    )
+    const transceivers =
+      role === 'offerer'
+        ? LAYOUT.map(({ kind }) => pc.addTransceiver(kind, { direction: 'sendrecv' }))
+        : []
 
     const link: Link = {
       pc,
       transceivers,
+      slotByMid: new Map(),
       earlyCandidates: [],
       remoteDescriptionSet: false,
       offerRetry: null,
@@ -491,11 +646,9 @@ export class Mesh {
       },
     }
 
-    // Attach whatever is already live locally.
-    for (const [index, { slot }] of LAYOUT.entries()) {
-      const track = this.local[slot]
-      if (track) void transceivers[index].sender.replaceTrack(track)
-    }
+    // Attach whatever is already live locally. An answerer has nowhere to put
+    // it yet; `adoptTransceivers` picks these up once the offer arrives.
+    this.attachLocal(link)
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -516,43 +669,35 @@ export class Mesh {
     }
 
     pc.ontrack = (event) => {
-      const index = link.transceivers.indexOf(event.transceiver)
-      const slot = LAYOUT[index]?.slot
-      if (!slot) return
+      const mid = event.transceiver.mid
+      const slot = mid === null ? undefined : link.slotByMid.get(mid)
+      if (!slot) {
+        // Worth a line rather than a silent return: this is exactly how the
+        // media went missing for four releases.
+        this.events.log(
+          `link ${peerId}: a ${event.track.kind} track arrived on mid ${mid ?? 'null'}, ` +
+            `which belongs to no slot — media for it will not be shown`,
+        )
+        return
+      }
 
       // Because the whole layout is negotiated up front, a receiver track
       // exists for every slot from the first answer — long before the peer
-      // publishes anything into it. `muted` is the flag that actually says
-      // whether media is flowing: it clears when the first packet arrives and
-      // comes back when the sender calls `replaceTrack(null)`.
+      // publishes anything into it, and whether or not it ever will. So the
+      // track alone says nothing, and `muted` on its own is not much better:
+      // an audio receiver unmutes as soon as the transport is up, carrying
+      // nothing, and a video receiver unmutes for the empty padding packets
+      // congestion control sends to measure the link.
       //
-      // Reporting the bare track instead would put a permanently black video
-      // in every tile, and leave the last frame of a camera or a screen share
-      // frozen on screen after it was turned off.
+      // `settleLive` is what decides, from bytes actually received. Muting is
+      // still worth acting on the moment it happens — that is a camera being
+      // switched off, and leaving the last frame frozen in the tile looks like
+      // a freeze rather than a choice.
       const track = event.track
-      const publish = () => {
-        const flowing = !track.muted
-        if (flowing) link.live.add(slot)
-        else link.live.delete(slot)
-        link.health.receiving = [...link.live]
-        this.events.onTrack(peerId, slot, flowing ? track : null)
-        this.report(peerId, link)
-      }
-      track.onunmute = () => {
-        this.events.log(`link ${peerId}: ${slot} is live`)
-        publish()
-      }
-      track.onmute = () => {
-        this.events.log(`link ${peerId}: ${slot} went quiet`)
-        publish()
-      }
-      track.onended = () => {
-        link.live.delete(slot)
-        link.health.receiving = [...link.live]
-        this.events.onTrack(peerId, slot, null)
-        this.report(peerId, link)
-      }
-      publish()
+      track.onunmute = () => void this.sampleLink(peerId, link)
+      track.onmute = () => this.setLive(peerId, link, slot, false, track)
+      track.onended = () => this.setLive(peerId, link, slot, false, track)
+      void this.sampleLink(peerId, link)
     }
 
     pc.oniceconnectionstatechange = () => {
@@ -608,6 +753,7 @@ export class Mesh {
     try {
       const offer = await link.pc.createOffer()
       await this.setLocalTuned(link, offer)
+      this.bindSlots(peerId, link, link.pc.localDescription?.sdp)
       this.events.send(peerId, { kind: 'offer', sdp: describe(link.pc.localDescription) })
       this.events.log(`link ${peerId}: offer sent`)
       this.scheduleOfferRetry(peerId, link, 1)
@@ -650,6 +796,7 @@ export class Mesh {
     try {
       const offer = await link.pc.createOffer({ iceRestart: true })
       await this.setLocalTuned(link, offer)
+      this.bindSlots(peerId, link, link.pc.localDescription?.sdp)
       this.events.send(peerId, { kind: 'offer', sdp: describe(link.pc.localDescription) })
       this.events.log(`link ${peerId}: ICE restart offered`)
       this.scheduleOfferRetry(peerId, link, 1)
