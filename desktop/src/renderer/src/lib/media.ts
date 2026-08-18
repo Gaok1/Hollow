@@ -114,10 +114,23 @@ export async function openScreen(
 ): Promise<ScreenCapture> {
   await window.hollow.screen.choose(sourceId)
 
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { frameRate: { ideal: frameRate, max: frameRate } },
-    audio: withSystemAudio,
-  })
+  const videoConstraints = { frameRate: { ideal: frameRate, max: frameRate } }
+  let stream: MediaStream
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: videoConstraints,
+      audio: withSystemAudio,
+    })
+  } catch (error) {
+    if (!withSystemAudio || !(error instanceof DOMException) || error.name !== 'NotReadableError') {
+      throw error
+    }
+    console.warn('System audio capture failed; sharing video without audio', error)
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: videoConstraints,
+      audio: false,
+    })
+  }
 
   const video = stream.getVideoTracks()[0]
   // Text stays legible when the encoder is squeezed; the alternative is a

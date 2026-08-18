@@ -69,14 +69,17 @@ function configureSession(): void {
   // Screen share. `audio: 'loopback'` captures what the machine is playing;
   // it is Windows-only, which is fine because Hollow is Windows-only today.
   ses.setDisplayMediaRequestHandler(
-    async (_request, callback) => {
+    async (request, callback) => {
       const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
       const chosen = sources.find((s) => s.id === pendingScreenSource) ?? sources[0]
       if (!chosen) {
         callback({})
         return
       }
-      callback({ video: chosen, audio: 'loopback' })
+      callback({
+        video: chosen,
+        ...(request.audioRequested ? { audio: 'loopback' as const } : {}),
+      })
     },
     // Hollow draws its own picker so it can show which sources carry audio.
     { useSystemPicker: false },
