@@ -100,22 +100,21 @@ function createWindow(): void {
 function configureSession(): void {
   const ses = session.defaultSession
 
-  // Screen share. `audio: 'loopback'` captures what the machine is playing;
-  // it is Windows-only, which is fine because Hollow is Windows-only today.
   ses.setDisplayMediaRequestHandler(
-    async (request, callback) => {
+    async (_request, callback) => {
       const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
       const chosen = sources.find((s) => s.id === pendingScreenSource) ?? sources[0]
       if (!chosen) {
         callback({})
         return
       }
-      callback({
-        video: chosen,
-        ...(request.audioRequested ? { audio: 'loopback' as const } : {}),
-      })
+      // Video only, on purpose. Electron's loopback capture is refused
+      // outright by a good number of Windows machines, and where it does work it
+      // returns the whole endpoint mix with no way to shape it or to leave the
+      // call itself out. Broadcast audio comes from the daemon's own capture.
+      callback({ video: chosen })
     },
-    // Hollow draws its own picker so it can show which sources carry audio.
+    // Hollow draws its own picker so it can show the windows by name.
     { useSystemPicker: false },
   )
 

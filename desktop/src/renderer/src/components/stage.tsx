@@ -7,7 +7,7 @@ import {
   useState,
   type MouseEvent,
 } from 'react'
-import { useStore } from '../store'
+import { feedKey, useStore } from '../store'
 import {
   MIC_BOOST_MAX,
   MIC_BOOST_MIN,
@@ -21,13 +21,19 @@ import type { Peer, TrackSlot } from '../types'
 import { Avatar } from './sidebar'
 import {
   AlertIcon,
+  CameraIcon,
+  MaximizeIcon,
   MicIcon,
   MicOffIcon,
+  MinimizeIcon,
   PinIcon,
+  PopOutIcon,
+  RestoreIcon,
   ScreenIcon,
   SpeakerIcon,
   SpeakerOffIcon,
 } from './icons'
+import { Slider } from './slider'
 
 /**
  * How long a link may sit unconnected before Hollow stops saying "connecting"
@@ -237,13 +243,22 @@ function PeerMenu({ peerId, x, y, onClose }: MenuAt & { onClose: () => void }) {
   const room = useStore((s) => s.room)
   const settings = useStore((s) => s.settings)
   const muted = useStore((s) => s.peerMuted[peerId] ?? false)
-  const pinned = useStore((s) => s.pinned)
+  const focus = useStore((s) => s.focus)
+  const remoteTracks = useStore((s) => s.remoteTracks[peerId])
+  const localTracks = useStore((s) => s.local)
   const setPeerVolume = useStore((s) => s.setPeerVolume)
   const togglePeerMuted = useStore((s) => s.togglePeerMuted)
   const setMicBoost = useStore((s) => s.setMicBoost)
-  const setPinned = useStore((s) => s.setPinned)
+  const setFocus = useStore((s) => s.setFocus)
   const toggle = useStore((s) => s.toggle)
   const [at, setAt] = useState({ left: x, top: y })
+
+  // What this person actually has on the wire, which is what can be enlarged.
+  const tracks = peerId === me?.id ? localTracks : (remoteTracks ?? {})
+  const feeds = [
+    tracks.screen && { key: feedKey(peerId, 'screen'), label: 'Maximize their screen' },
+    tracks.camera && { key: feedKey(peerId, 'camera'), label: 'Enlarge their camera' },
+  ].filter((feed): feed is { key: string; label: string } => Boolean(feed))
 
   // Opened at the pointer, then pulled back inside the window. A menu that
   // spills off the bottom edge is a menu whose last item cannot be clicked.
@@ -293,14 +308,12 @@ function PeerMenu({ peerId, x, y, onClose }: MenuAt & { onClose: () => void }) {
         <>
           <div className="menu__row">
             <MicIcon size={14} />
-            <input
-              className="slider"
-              type="range"
+            <Slider
               min={MIC_BOOST_MIN}
               max={MIC_BOOST_MAX}
               step={0.05}
               value={settings.micBoost}
-              onChange={(e) => setMicBoost(Number(e.target.value))}
+              onChange={setMicBoost}
             />
             <span className="menu__value">{Math.round(settings.micBoost * 100)}%</span>
           </div>
@@ -333,15 +346,13 @@ function PeerMenu({ peerId, x, y, onClose }: MenuAt & { onClose: () => void }) {
             >
               {muted ? <SpeakerOffIcon size={14} /> : <SpeakerIcon size={14} />}
             </button>
-            <input
-              className="slider"
-              type="range"
+            <Slider
               min={0}
               max={PEER_VOLUME_MAX}
               step={0.05}
               value={volume}
               disabled={muted}
-              onChange={(e) => setPeerVolume(peer.id, Number(e.target.value))}
+              onChange={(next) => setPeerVolume(peer.id, next)}
             />
             <span className="menu__value">{Math.round(volume * 100)}%</span>
           </div>
@@ -359,17 +370,35 @@ function PeerMenu({ peerId, x, y, onClose }: MenuAt & { onClose: () => void }) {
         </>
       )}
 
-      <button
-        className="menu__item"
-        onClick={() => {
-          setPinned(pinned === peer.id ? null : peer.id)
-          onClose()
-        }}
-      >
-        {pinned === peer.id ? 'Unpin from the stage' : 'Pin to the stage'}
-      </button>
+      {feeds.map(({ key, label }) => (
+        <button
+          key={key}
+          className="menu__item"
+          onClick={() => {
+            setFocus(focus === key ? null : key)
+            onClose()
+          }}
+        >
+          {focus === key ? 'Back to the grid' : label}
+        </button>
+      ))}
     </div>
   )
+}
+
+/**
+ * One video somebody is sending, and everything the stage needs to place it.
+ *
+ * A peer id alone was enough while only one screen could ever be on the stage.
+ * With windows there can be several, from several people, plus a camera pulled
+ * out of the grid — so a feed is the unit, and {@link feedKey} names it.
+ */
+interface Feed {
+  key: string
+  peer: Peer
+  slot: 'camera' | 'screen'
+  track: MediaStreamTrack
+  isSelf: boolean
 }
 
 interface TileProps {
@@ -382,7 +411,7 @@ interface TileProps {
   cameraOn: boolean
   isSelf: boolean
   compact?: boolean
-  onPin?: () => void
+  onEnlarge?: () => void
   onMenu?: (event: MouseEvent) => void
 }
 
@@ -395,7 +424,7 @@ function Tile({
   cameraOn,
   isSelf,
   compact,
-  onPin,
+  onEnlarge,
   onMenu,
 }: TileProps) {
   const videoRef = useTrack<HTMLVideoElement>(video)
@@ -424,7 +453,7 @@ function Tile({
   return (
     <div
       className={`tile ${compact ? 'tile--compact' : ''} ${speaking ? 'tile--speaking' : ''}`}
-      onDoubleClick={onPin}
+      onDoubleClick={onEnlarge}
       onContextMenu={onMenu}
     >
       {status && <span className="tile__status">{status}</span>}
@@ -470,6 +499,133 @@ function Tile({
   )
 }
 
+/**
+ * One feed as a window: someone's screen, or a camera somebody asked to see big.
+ *
+ * The bar is deliberately a window's bar rather than a label. Two people sharing
+ * at once used to mean one of the two shares simply never appeared, and the fix
+ * for that is not a better guess about which one matters — it is handing both to
+ * the user with the controls to say.
+ */
+function Pane({
+  feed,
+  maximized,
+  onFocus,
+  onMinimize,
+  onMenu,
+}: {
+  feed: Feed
+  maximized: boolean
+  onFocus: () => void
+  onMinimize: () => void
+  onMenu?: (event: MouseEvent) => void
+}) {
+  const videoRef = useTrack<HTMLVideoElement>(feed.track)
+  const [popped, setPopped] = useState(false)
+
+  // Picture-in-picture is a real window: it survives Hollow being alt-tabbed
+  // away from, which is the whole point of watching a share while doing
+  // something else. It can also be closed from its own chrome, hence the
+  // listeners rather than a boolean this side keeps to itself.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    const enter = () => setPopped(true)
+    const leave = () => setPopped(false)
+    video.addEventListener('enterpictureinpicture', enter)
+    video.addEventListener('leavepictureinpicture', leave)
+    return () => {
+      video.removeEventListener('enterpictureinpicture', enter)
+      video.removeEventListener('leavepictureinpicture', leave)
+    }
+  }, [videoRef])
+
+  const popOut = async () => {
+    const video = videoRef.current
+    if (!video) return
+    try {
+      if (document.pictureInPictureElement === video) await document.exitPictureInPicture()
+      else await video.requestPictureInPicture()
+    } catch (error) {
+      // A track that has not produced a frame yet cannot be popped out, and
+      // neither can one in a build with picture-in-picture turned off.
+      console.warn('That feed would not open in its own window', error)
+    }
+  }
+
+  const mirrored = feed.slot === 'camera' && feed.isSelf
+
+  return (
+    <div
+      className={`pane ${maximized ? 'pane--maximized' : ''}`}
+      onDoubleClick={onFocus}
+      onContextMenu={onMenu}
+    >
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className={mirrored ? 'pane__video pane__video--mirrored' : 'pane__video'}
+      />
+
+      {popped && <div className="pane__popped">Playing in its own window</div>}
+
+      <div className="pane__bar">
+        {feed.slot === 'screen' ? <ScreenIcon size={14} /> : <CameraIcon size={14} />}
+        <span className="pane__name">
+          {feed.isSelf ? 'You' : feed.peer.persona}
+          {feed.slot === 'screen' ? ' — sharing' : ''}
+        </span>
+        <div className="pane__buttons">
+          <button
+            className="iconbtn"
+            onClick={() => void popOut()}
+            aria-label={popped ? 'Bring it back' : 'Open in its own window'}
+            title={popped ? 'Bring it back' : 'Open in its own window'}
+          >
+            <PopOutIcon />
+          </button>
+          <button
+            className="iconbtn"
+            onClick={onFocus}
+            aria-label={maximized ? 'Back to the grid' : 'Maximize'}
+            title={maximized ? 'Back to the grid' : 'Maximize'}
+          >
+            {maximized ? <RestoreIcon /> : <MaximizeIcon />}
+          </button>
+          <button
+            className="iconbtn"
+            onClick={onMinimize}
+            aria-label="Minimize"
+            title="Minimize — it keeps arriving, it just stops taking the stage"
+          >
+            <MinimizeIcon />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Where minimized windows wait. Clicking one brings it back. */
+function Dock({ feeds, onRestore }: { feeds: Feed[]; onRestore: (key: string) => void }) {
+  if (feeds.length === 0) return null
+  return (
+    <div className="dock">
+      {feeds.map((feed) => (
+        <button key={feed.key} className="dock__item" onClick={() => onRestore(feed.key)}>
+          {feed.slot === 'screen' ? <ScreenIcon size={13} /> : <CameraIcon size={13} />}
+          <span>
+            {feed.isSelf ? 'Your' : feed.peer.persona + "'s"} {feed.slot}
+          </span>
+          <MaximizeIcon size={12} />
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export function Stage() {
   const me = useStore((s) => s.me)
   const room = useStore((s) => s.room)
@@ -477,8 +633,10 @@ export function Stage() {
   const presence = useStore((s) => s.presence)
   const local = useStore((s) => s.local)
   const localPresence = useStore((s) => s.localPresence)
-  const pinned = useStore((s) => s.pinned)
-  const setPinned = useStore((s) => s.setPinned)
+  const focus = useStore((s) => s.focus)
+  const minimized = useStore((s) => s.minimized)
+  const setFocus = useStore((s) => s.setFocus)
+  const toggleMinimized = useStore((s) => s.toggleMinimized)
   const createRoom = useStore((s) => s.createRoom)
   const peerVolume = useStore((s) => s.settings.peerVolume)
   const peerMuted = useStore((s) => s.peerMuted)
@@ -499,33 +657,57 @@ export function Stage() {
 
   const openMenu = (peerId: string) => (event: MouseEvent) => {
     event.preventDefault()
-    // Filmstrip tiles sit inside the presenter, which has its own handler; the
-    // tile the pointer is actually over is the one that should win.
+    // Filmstrip tiles sit inside a pane, which has its own handler; the tile the
+    // pointer is actually over is the one that should win.
     event.stopPropagation()
     setMenu({ peerId, x: event.clientX, y: event.clientY })
   }
-
-  /**
-   * Whoever is sharing takes the stage. An explicit pin wins; otherwise the
-   * first active share does, which is the right guess in the overwhelmingly
-   * common case of exactly one person presenting.
-   */
-  const presenter = useMemo(() => {
-    if (pinned) return pinned
-    if (localPresence.sharingScreen) return me?.id ?? null
-    const sharer = members.find((m) => presence[m.id]?.sharingScreen)
-    return sharer?.id ?? null
-  }, [pinned, localPresence.sharingScreen, members, presence, me])
-
-  const presenterTrack: MediaStreamTrack | undefined =
-    presenter === me?.id ? local.screen : remoteTracks[presenter ?? '']?.screen
-
-  const presenterRef = useTrack<HTMLVideoElement>(presenterTrack)
 
   const trackFor = (peerId: string, slot: TrackSlot): MediaStreamTrack | undefined =>
     peerId === me?.id
       ? (local[slot] as MediaStreamTrack | undefined)
       : remoteTracks[peerId]?.[slot]
+
+  /**
+   * Every video anybody is sending, screens before cameras.
+   *
+   * Built from tracks rather than from presence: a share that was announced and
+   * never arrived has nothing to put in a window, and would leave a black
+   * rectangle where the grid used to be.
+   */
+  const feeds: Feed[] = useMemo(() => {
+    const out: Feed[] = []
+    for (const peer of members) {
+      for (const slot of ['screen', 'camera'] as const) {
+        const track =
+          peer.id === me?.id
+            ? (local[slot] as MediaStreamTrack | undefined)
+            : remoteTracks[peer.id]?.[slot]
+        if (track) {
+          out.push({ key: feedKey(peer.id, slot), peer, slot, track, isSelf: peer.id === me?.id })
+        }
+      }
+    }
+    return out
+  }, [members, remoteTracks, local, me])
+
+  const focused = feeds.find((feed) => feed.key === focus) ?? null
+  const folded = feeds.filter((feed) => minimized.includes(feed.key))
+
+  /**
+   * What the stage shows large.
+   *
+   * Screens take it by themselves — that is what sharing means — and a camera
+   * joins them only once somebody has asked for it. Whatever is focused leads,
+   * so maximizing a second share changes which one dominates instead of hiding
+   * the other.
+   */
+  const windows = useMemo(() => {
+    const shares = feeds.filter(
+      (feed) => feed.slot === 'screen' && !minimized.includes(feed.key) && feed.key !== focus,
+    )
+    return focused ? [focused, ...shares] : shares
+  }, [feeds, focused, focus, minimized])
 
   if (!room) {
     return (
@@ -544,6 +726,47 @@ export function Stage() {
     )
   }
 
+  /** Double-clicking a tile enlarges whatever that person is actually sending. */
+  const enlarge = (peerId: string) => () => {
+    const own = feeds.filter((feed) => feed.peer.id === peerId)
+    const wanted = own.find((feed) => feed.slot === 'camera') ?? own[0]
+    if (!wanted) return
+    setFocus(focus === wanted.key ? null : wanted.key)
+  }
+
+  const pane = (feed: Feed) => (
+    <Pane
+      key={feed.key}
+      feed={feed}
+      maximized={feed.key === focus}
+      onFocus={() => setFocus(feed.key === focus ? null : feed.key)}
+      onMinimize={() => toggleMinimized(feed.key)}
+      onMenu={openMenu(feed.peer.id)}
+    />
+  )
+
+  const tile = (compact: boolean) => (member: Peer) => (
+    <Tile
+      key={member.id}
+      compact={compact}
+      peer={member}
+      video={trackFor(member.id, 'camera')}
+      audio={trackFor(member.id, 'mic')}
+      micMuted={
+        member.id === me?.id ? localPresence.micMuted : (presence[member.id]?.micMuted ?? true)
+      }
+      sharing={
+        member.id === me?.id
+          ? localPresence.sharingScreen
+          : (presence[member.id]?.sharingScreen ?? false)
+      }
+      cameraOn={cameraOnFor(member.id)}
+      isSelf={member.id === me?.id}
+      onEnlarge={enlarge(member.id)}
+      onMenu={openMenu(member.id)}
+    />
+  )
+
   return (
     <section className="stage">
       <CallStatus />
@@ -560,75 +783,32 @@ export function Stage() {
           ))}
       </div>
 
-      {presenterTrack ? (
-        <div
-          className="presenter"
-          // The filmstrip tile is still there, but the thing filling the screen
-          // is what a right-click will land on.
-          onContextMenu={presenter ? openMenu(presenter) : undefined}
-        >
-          <video ref={presenterRef} autoPlay playsInline muted className="presenter__video" />
-          <div className="presenter__label">
-            <ScreenIcon size={14} />
-            {members.find((m) => m.id === presenter)?.persona ?? 'Someone'} is sharing
-            {pinned && (
-              <button className="btn btn--ghost btn--tiny" onClick={() => setPinned(null)}>
-                Unpin
-              </button>
+      {windows.length > 0 ? (
+        <div className="windowed">
+          <div
+            className={`windows ${focused ? 'windows--focused' : ''}`}
+            data-count={Math.min(windows.length, 4)}
+          >
+            {pane(windows[0])}
+            {/* Behind the lead pane rather than beside it: a maximized window
+                that is the same size as the rest is not maximized. */}
+            {focused && windows.length > 1 && (
+              <div className="windows__rest">{windows.slice(1).map(pane)}</div>
             )}
+            {!focused && windows.slice(1).map(pane)}
           </div>
 
-          <div className="filmstrip">
-            {members.map((member) => (
-              <Tile
-                key={member.id}
-                compact
-                peer={member}
-                video={trackFor(member.id, 'camera')}
-                audio={trackFor(member.id, 'mic')}
-                micMuted={
-                  member.id === me?.id
-                    ? localPresence.micMuted
-                    : (presence[member.id]?.micMuted ?? true)
-                }
-                sharing={
-                  member.id === me?.id
-                    ? localPresence.sharingScreen
-                    : (presence[member.id]?.sharingScreen ?? false)
-                }
-                cameraOn={cameraOnFor(member.id)}
-                isSelf={member.id === me?.id}
-                onPin={() => setPinned(member.id)}
-                onMenu={openMenu(member.id)}
-              />
-            ))}
-          </div>
+          <Dock feeds={folded} onRestore={toggleMinimized} />
+
+          <div className="filmstrip">{members.map(tile(true))}</div>
         </div>
       ) : (
-        <div className="grid" data-count={members.length}>
-          {members.map((member) => (
-            <Tile
-              key={member.id}
-              peer={member}
-              video={trackFor(member.id, 'camera')}
-              audio={trackFor(member.id, 'mic')}
-              micMuted={
-                member.id === me?.id
-                  ? localPresence.micMuted
-                  : (presence[member.id]?.micMuted ?? true)
-              }
-              sharing={
-                member.id === me?.id
-                  ? localPresence.sharingScreen
-                  : (presence[member.id]?.sharingScreen ?? false)
-              }
-              cameraOn={cameraOnFor(member.id)}
-              isSelf={member.id === me?.id}
-              onPin={() => setPinned(member.id)}
-              onMenu={openMenu(member.id)}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid" data-count={members.length}>
+            {members.map(tile(false))}
+          </div>
+          <Dock feeds={folded} onRestore={toggleMinimized} />
+        </>
       )}
 
       {members.length === 1 && (

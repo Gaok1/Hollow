@@ -176,13 +176,6 @@ fn run(
                 Ok(MixerCommand::SetMasterGain { gain }) => {
                     gains.master = gain.clamp(0.0, 2.0);
                 }
-                Ok(MixerCommand::SetSessionVolume { pid, volume, muted }) => {
-                    if let Some(host) = host.as_ref() {
-                        if let Err(err) = host.set_session_volume(pid, volume, muted) {
-                            tracing::warn!("set session volume for {pid}: {err}");
-                        }
-                    }
-                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     stop = true;

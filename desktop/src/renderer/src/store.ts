@@ -7,6 +7,7 @@ import {
   openCamera,
   openMicrophone,
   openScreen,
+  retuneScreen,
   type MicrophoneSource,
 } from './lib/media'
 import type {
@@ -81,6 +82,25 @@ export interface Settings {
   /** Screen share frame rate. 60 for motion, 15 for reading documents. */
   screenFrameRate: number
   /**
+   * Tallest the share is allowed to be, or 0 for the display's own resolution.
+   *
+   * Paired with the frame rate rather than derived from it: the two trade
+   * against each other inside one bitrate, and which one to give up is a
+   * judgement about what is being shared, not something to guess.
+   */
+  screenHeight: number
+  /**
+   * Whether a share carries the machine's audio.
+   *
+   * `auto` sends it only where the daemon can capture applications one by one.
+   * Without that, all there is to capture is the whole output — which includes
+   * the call itself, so everyone would hear themselves come back. See
+   * {@link systemAudioWanted}.
+   */
+  systemAudio: 'auto' | 'on' | 'off'
+  /** Master gain over the outgoing broadcast mix, where 1 is untouched. */
+  broadcastGain: number
+  /**
    * Gain applied to the microphone before it is sent, where 1 is untouched.
    * See {@link MIC_BOOST_MAX}.
    */
@@ -100,7 +120,31 @@ export interface Settings {
   turnCredential?: string
 }
 
-const DEFAULT_SETTINGS: Settings = { screenFrameRate: 30, micBoost: 1, peerVolume: {} }
+const DEFAULT_SETTINGS: Settings = {
+  screenFrameRate: 30,
+  screenHeight: 1080,
+  systemAudio: 'auto',
+  broadcastGain: 1,
+  micBoost: 1,
+  peerVolume: {},
+}
+
+/** How much of the broadcast may be turned up before it is asking for trouble. */
+export const BROADCAST_GAIN_MAX = 2
+
+/**
+ * Does a share on this machine carry system audio?
+ *
+ * The honest answer on Windows 10 is no by default. Per-application capture
+ * arrived in build 20348; before it, the only thing that can be captured is the
+ * render endpoint, and Hollow is playing the call into that endpoint. Sending it
+ * on means every peer hears their own voice a moment late, which is worse than
+ * silent game audio — so it is offered as a switch and left off.
+ */
+export const systemAudioWanted = (
+  choice: Settings['systemAudio'],
+  perProcessCapture: boolean,
+): boolean => (choice === 'auto' ? perProcessCapture : choice === 'on')
 
 /**
  * A gain, in range and to two decimals.
@@ -124,6 +168,8 @@ function loadSettings(): Settings {
     return {
       ...stored,
       micBoost: Number.isFinite(stored.micBoost) ? stored.micBoost : 1,
+      broadcastGain: Number.isFinite(stored.broadcastGain) ? stored.broadcastGain : 1,
+      screenHeight: Number.isFinite(stored.screenHeight) ? stored.screenHeight : 1080,
       peerVolume: stored.peerVolume ?? {},
     }
   } catch {
@@ -153,6 +199,17 @@ function iceServers(settings: Settings): RTCIceServer[] {
   return servers
 }
 
+/**
+ * Names one video feed: a person and which of their two cameras it is.
+ *
+ * The stage needs to talk about "that screen" and "that camera" separately —
+ * one person can be sending both — and a plain peer id cannot say which.
+ */
+export const feedKey = (peerId: string, slot: 'camera' | 'screen'): string => `${peerId}:${slot}`
+
+/** The peer half of a {@link feedKey}. */
+export const feedPeer = (key: string): string => key.slice(0, key.lastIndexOf(':'))
+
 interface State {
   info: AppInfo | null
   me: Peer | null
@@ -178,8 +235,19 @@ interface State {
 
   local: Partial<Record<TrackSlot, MediaStreamTrack>>
   localPresence: Presence
-  /** Which peer's screen fills the stage; null picks automatically. */
-  pinned: string | null
+  /**
+   * Which feed fills the stage, as a {@link feedKey}, or null to let the stage
+   * decide — which means whoever is sharing, and the grid when nobody is.
+   */
+  focus: string | null
+  /**
+   * Feeds folded away into the dock, as {@link feedKey}s.
+   *
+   * A share nobody is watching still arrives, still costs bandwidth and still
+   * belongs to the person who started it, so this hides the window rather than
+   * closing anything down.
+   */
+  minimized: string[]
 
   mixer: MixerSnapshot | null
   /** Broadcast gains, keyed by pid. */
@@ -211,7 +279,7 @@ interface State {
   stopShare(): Promise<void>
 
   setGain(pid: number, gain: number, muted: boolean): Promise<void>
-  setSessionVolume(pid: number, volume: number, muted: boolean): Promise<void>
+  refreshBroadcastAudio(): Promise<void>
   setMasterGain(gain: number): Promise<void>
 
   /** Gain on what we send, 0 to {@link MIC_BOOST_MAX}. Applies to the live call at once. */
@@ -227,7 +295,8 @@ interface State {
   copyReport(): Promise<boolean>
   revealLog(): Promise<void>
   updateSettings(patch: Partial<Settings>): void
-  setPinned(peerId: string | null): void
+  setFocus(key: string | null): void
+  toggleMinimized(key: string): void
   toggle(panel: 'settings' | 'mixer' | 'chat'): void
   dismissToast(id: number): void
   acceptInvite(toast: Toast): Promise<void>
@@ -252,6 +321,8 @@ export const useStore = create<State>((set, get) => ({
   chatUnread: 0,
   remoteTracks: {},
   local: {},
+  focus: null,
+  minimized: [],
   localPresence: {
     micMuted: true,
     deafened: false,
@@ -325,7 +396,8 @@ export const useStore = create<State>((set, get) => ({
           health: {},
           presence: {},
           peerMuted: {},
-          pinned: null,
+          focus: null,
+          minimized: [],
           chat: [],
           chatUnread: 0,
           chatOpen: false,
@@ -401,7 +473,13 @@ export const useStore = create<State>((set, get) => ({
             const health = { ...s.health }
             delete remoteTracks[id]
             delete health[id]
-            return { remoteTracks, health, pinned: s.pinned === id ? null : s.pinned }
+            // Their windows go with them, focus included.
+            return {
+              remoteTracks,
+              health,
+              focus: s.focus && feedPeer(s.focus) === id ? null : s.focus,
+              minimized: s.minimized.filter((key) => feedPeer(key) !== id),
+            }
           })
           break
         }
@@ -795,30 +873,28 @@ export const useStore = create<State>((set, get) => ({
     const { info, settings, local, localPresence } = get()
     set({ pickerOpen: false })
 
-    // Per-process capture means the Rust mixer owns broadcast audio and can
-    // include or exclude individual apps. Without it, Electron's whole-system
-    // loopback is the only option available.
     const perProcess = info?.capabilities.perProcessCapture ?? false
+    const wantsAudio = systemAudioWanted(settings.systemAudio, perProcess)
 
     try {
-      const capture = await openScreen(sourceId, !perProcess, settings.screenFrameRate)
-      await mesh?.setLocalTrack('screen', capture.video)
+      const video = await openScreen(sourceId, settings.screenFrameRate, settings.screenHeight)
+      await mesh?.setLocalTrack('screen', video)
 
-      let audioTrack: MediaStreamTrack | null = capture.audio
+      let audioTrack: MediaStreamTrack | null = null
 
-      if (perProcess && info) {
+      // Broadcast audio always comes from the daemon, in both capture modes.
+      // It is the only source that can be shaped without touching what this
+      // machine is playing: the gains live in the mixer thread, on the way out.
+      if (wantsAudio && info) {
         await rpc('audio.start')
+        await rpc('audio.master', { gain: settings.broadcastGain })
         audioTrack = await broadcastAudio.start(info.audioPipe)
-      } else {
-        // Even without per-process capture the mixer panel is useful: it drives
-        // the Windows session volumes, which is what shapes the loopback mix.
-        await rpc('audio.start')
       }
 
       if (audioTrack) await mesh?.setLocalTrack('screenAudio', audioTrack)
 
       // The user stopping the share from Windows' own overlay must be honoured.
-      capture.video.onended = () => void get().stopShare()
+      video.onended = () => void get().stopShare()
 
       const presence = {
         ...localPresence,
@@ -828,7 +904,7 @@ export const useStore = create<State>((set, get) => ({
       set({
         local: {
           ...local,
-          screen: capture.video,
+          screen: video,
           ...(audioTrack ? { screenAudio: audioTrack } : {}),
         },
         localPresence: presence,
@@ -876,12 +952,47 @@ export const useStore = create<State>((set, get) => ({
     await rpc('audio.tracks', { tracks })
   },
 
-  async setSessionVolume(pid, volume, muted) {
-    await rpc('audio.session', { pid, volume, muted })
+  /**
+   * Start or stop sending the machine's audio, without interrupting the share.
+   *
+   * The switch for this sits in the mixer, which opens the moment a share
+   * starts — so "not until you share again" would be the wrong answer to
+   * flicking it. `replaceTrack` needs no renegotiation, so the video never
+   * stutters for it.
+   */
+  async refreshBroadcastAudio() {
+    const { info, settings, local, localPresence } = get()
+    if (!info || !localPresence.sharingScreen) return
+
+    const wanted = systemAudioWanted(settings.systemAudio, info.capabilities.perProcessCapture)
+    if (wanted === Boolean(local.screenAudio)) return
+
+    if (wanted) {
+      await rpc('audio.start')
+      await rpc('audio.master', { gain: settings.broadcastGain })
+      const track = await broadcastAudio.start(info.audioPipe)
+      await mesh?.setLocalTrack('screenAudio', track)
+      set((s) => ({
+        local: { ...s.local, screenAudio: track },
+        localPresence: { ...s.localPresence, sharingAudio: true },
+      }))
+    } else {
+      local.screenAudio?.stop()
+      await mesh?.setLocalTrack('screenAudio', null)
+      await broadcastAudio.stop()
+      await rpc('audio.stop').catch(() => {})
+      set((s) => {
+        const next = { ...s.local }
+        delete next.screenAudio
+        return { local: next, localPresence: { ...s.localPresence, sharingAudio: false } }
+      })
+    }
+    await rpc('presence.set', get().localPresence).catch(() => {})
   },
 
   async setMasterGain(gain) {
-    await rpc('audio.master', { gain })
+    get().updateSettings({ broadcastGain: clampGain(gain, BROADCAST_GAIN_MAX) })
+    await rpc('audio.master', { gain: get().settings.broadcastGain })
   },
 
   setMicBoost(boost) {
@@ -908,10 +1019,26 @@ export const useStore = create<State>((set, get) => ({
     set({ settings })
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
     mesh?.setIceServers(iceServers(settings))
+
+    const screen = get().local.screen
+    if (screen && (patch.screenFrameRate !== undefined || patch.screenHeight !== undefined)) {
+      void retuneScreen(screen, settings.screenFrameRate, settings.screenHeight)
+    }
+    if (patch.systemAudio !== undefined) void get().refreshBroadcastAudio()
   },
 
-  setPinned(peerId) {
-    set({ pinned: peerId })
+  setFocus(key) {
+    // Enlarging a window that was folded away is a request to see it.
+    set((s) => ({ focus: key, minimized: s.minimized.filter((other) => other !== key) }))
+  },
+
+  toggleMinimized(key) {
+    set((s) => ({
+      minimized: s.minimized.includes(key)
+        ? s.minimized.filter((other) => other !== key)
+        : [...s.minimized, key],
+      focus: s.focus === key ? null : s.focus,
+    }))
   },
 
   toggle(panel) {

@@ -156,53 +156,14 @@ impl SessionHost {
             });
         }
 
-        // Loudest first among active sessions keeps the mixer stable-ish while
-        // still surfacing whatever is actually making noise.
-        out.sort_by(|a, b| {
-            b.active
-                .cmp(&a.active)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        // By name, and only by name. Sorting the active ones to the top reads
+        // well in a screenshot and badly in the hand: an app that falls quiet
+        // for a moment takes its row with it, and a slider being dragged moves
+        // out from under the pointer.
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         Ok(out)
     }
 
-    /// Set a Windows session's volume. This is the same control as the system
-    /// volume mixer: it changes what the local user hears.
-    pub fn set_session_volume(
-        &self,
-        pid: u32,
-        volume: f32,
-        muted: bool,
-    ) -> Result<(), AudioError> {
-        // SAFETY: manager is live.
-        let list = unsafe { self.manager.GetSessionEnumerator()? };
-        // SAFETY: same.
-        let count = unsafe { list.GetCount()? };
-
-        for index in 0..count {
-            // SAFETY: index within count.
-            let Ok(control) = (unsafe { list.GetSession(index) }) else {
-                continue;
-            };
-            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
-                continue;
-            };
-            // SAFETY: live interface.
-            if unsafe { control2.GetProcessId() }.unwrap_or(0) != pid {
-                continue;
-            }
-            if let Ok(vol) = control2.cast::<ISimpleAudioVolume>() {
-                // SAFETY: live interface. A null event context means "this
-                // change did not originate from a registered notification
-                // client", which is exactly our situation.
-                unsafe {
-                    vol.SetMasterVolume(volume.clamp(0.0, 1.0), std::ptr::null())?;
-                    vol.SetMute(muted, std::ptr::null())?;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Full path of a process, or None when it has exited or we lack rights.

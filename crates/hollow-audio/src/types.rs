@@ -131,8 +131,6 @@ pub enum MixerCommand {
     SetTracks { tracks: Vec<TrackGain> },
     /// Master gain over the whole broadcast mix.
     SetMasterGain { gain: f32 },
-    /// Directly set a Windows session's volume (affects local playback).
-    SetSessionVolume { pid: u32, volume: f32, muted: bool },
     /// Tear the engine down and end its thread.
     Shutdown,
 }

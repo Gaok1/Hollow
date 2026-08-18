@@ -243,21 +243,6 @@ impl App {
                 Ok(Value::Null)
             }
 
-            "audio.session" => {
-                let pid = params
-                    .get("pid")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow!("audio.session needs a pid"))? as u32;
-                let volume = params.get("volume").and_then(Value::as_f64).unwrap_or(1.0) as f32;
-                let muted = params
-                    .get("muted")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                self.audio
-                    .send(MixerCommand::SetSessionVolume { pid, volume, muted });
-                Ok(Value::Null)
-            }
-
             // --- files ------------------------------------------------------
             "files.send" => {
                 let to = steam_id(&params, "to")?;

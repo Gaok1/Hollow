@@ -774,40 +774,193 @@ select {
   background: var(--surface-hover);
 }
 
-.presenter {
+/*
+ * Windows on the stage.
+ *
+ * One share fills the space, two split it, more tile — and whatever is
+ * maximized takes the top row across the full width, so the others stay
+ * visible instead of being replaced by it. Which is the difference between
+ * enlarging a feed and losing the rest.
+ */
+.windowed {
   flex: 1;
   display: flex;
   flex-direction: column;
   gap: 12px;
   min-height: 0;
-  position: relative;
 }
 
-.presenter__video {
+.windows {
   flex: 1;
-  width: 100%;
+  display: grid;
+  gap: 12px;
   min-height: 0;
-  /* `contain`, never `cover`: cropping someone's shared screen hides content. */
-  object-fit: contain;
+  grid-template-columns: 1fr;
+}
+
+.windows[data-count='2'],
+.windows[data-count='3'],
+.windows[data-count='4'] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.windows[data-count='3'],
+.windows[data-count='4'] {
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+.pane {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   background: #000;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
 }
 
-.presenter__label {
+/*
+ * With one window maximized the grid gives way to a lead pane and a strip: the
+ * maximized one has to actually be bigger than what it was maximized over,
+ * which a grid row cannot promise once there are three of them.
+ */
+.windows--focused {
+  display: flex;
+  flex-direction: column;
+  grid-template-columns: none;
+}
+
+.windows--focused > .pane {
+  flex: 3;
+}
+
+.windows__rest {
+  flex: 1;
+  display: flex;
+  gap: 12px;
+  min-height: 0;
+}
+
+.windows__rest > .pane {
+  flex: 1;
+  min-width: 0;
+}
+
+.pane--maximized {
+  border-color: var(--line-strong);
+}
+
+.pane__video {
+  width: 100%;
+  height: 100%;
+  /* `contain`, never `cover`: cropping someone's shared screen hides content. */
+  object-fit: contain;
+  display: block;
+}
+
+.pane__video--mirrored {
+  transform: scaleX(-1);
+}
+
+.pane__bar {
   position: absolute;
-  top: 12px;
-  left: 12px;
+  top: 8px;
+  left: 8px;
+  right: 8px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 10px;
+  gap: 8px;
+  padding: 5px 6px 5px 10px;
   font-size: 12px;
+  color: var(--text-dim);
   background: rgba(10, 12, 17, 0.82);
   backdrop-filter: blur(8px);
   border: 1px solid var(--line);
   border-radius: 999px;
+  /* Legible from across the room, because it says whose screen this is — the
+     buttons only come up out of the background under the pointer. */
+  opacity: 0.75;
+  transition: opacity 140ms var(--ease);
+}
+
+.pane:hover .pane__bar,
+.pane:focus-within .pane__bar {
+  opacity: 1;
+}
+
+.pane__buttons {
+  opacity: 0;
+  transition: opacity 140ms var(--ease);
+}
+
+.pane:hover .pane__buttons,
+.pane:focus-within .pane__buttons {
+  opacity: 1;
+}
+
+.pane__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane__buttons {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* A popped-out feed leaves its pane empty, which reads as a broken share
+   unless the pane says where it went. */
+.pane__popped {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  background: rgba(10, 12, 17, 0.7);
+}
+
+.dock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.dock__item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  font-size: 12px;
   color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+
+.dock__item:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.master__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Why an app in the list has no level: Windows has it muted, which is the
+   user's own doing and not something Hollow will undo for them. */
+.session__note {
+  font-size: 11.5px;
+  color: var(--text-faint);
 }
 
 .filmstrip {

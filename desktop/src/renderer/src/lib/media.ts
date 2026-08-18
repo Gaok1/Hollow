@@ -192,59 +192,69 @@ export async function openCamera(deviceId?: string): Promise<MediaStreamTrack> {
   return stream.getVideoTracks()[0]
 }
 
-export interface ScreenCapture {
-  video: MediaStreamTrack
-  /** Present only when Electron's loopback capture supplied system audio. */
-  audio: MediaStreamTrack | null
+/**
+ * Capture constraints for a share.
+ *
+ * A height of 0 means whatever the display is. Capping it is the cheapest way
+ * to make a share readable on a thin connection: a 4K desktop scaled into the
+ * same bitrate as a 1080p one spends every bit on pixels nobody can read.
+ */
+function screenConstraints(frameRate: number, height: number): MediaTrackConstraints {
+  return {
+    frameRate: { ideal: frameRate, max: frameRate },
+    ...(height > 0 ? { height: { max: height } } : {}),
+  }
 }
 
 /**
  * Capture a screen or window.
  *
+ * Audio is never asked for here. Chromium's loopback capture fails outright on
+ * plenty of Windows machines — a busy exclusive-mode endpoint, an unusual driver
+ * stack — and where it works it hands back the whole endpoint mix with no way to
+ * shape it. The daemon's own capture is the one path for broadcast audio, in
+ * both capture modes; see {@link BroadcastAudio}.
+ *
  * The source is staged in the main process first, because Electron's
  * display-media handler cannot ask the renderer which source to use once the
  * request is in flight.
- *
- * @param withSystemAudio ask Electron for loopback audio. Used on Windows
- * builds without per-process capture; where per-process capture exists the
- * audio comes from the Rust mixer instead, via {@link BroadcastAudio}.
  */
 export async function openScreen(
   sourceId: string,
-  withSystemAudio: boolean,
   frameRate: number,
-): Promise<ScreenCapture> {
+  height: number,
+): Promise<MediaStreamTrack> {
   await window.hollow.screen.choose(sourceId)
 
-  const videoConstraints = { frameRate: { ideal: frameRate, max: frameRate } }
-  let stream: MediaStream
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: videoConstraints,
-      audio: withSystemAudio,
-    })
-  } catch (error) {
-    // Loopback capture fails in more ways than one — a busy exclusive-mode
-    // endpoint raises NotReadableError, a missing render device InvalidState,
-    // some driver stacks NotAllowedError. None of them are a reason to refuse
-    // to share the screen, which is what the user actually asked for.
-    if (!withSystemAudio) throw error
-    console.warn('System audio capture failed; sharing video without audio', error)
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: videoConstraints,
-      audio: false,
-    })
-  }
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: screenConstraints(frameRate, height),
+    audio: false,
+  })
 
   const video = stream.getVideoTracks()[0]
   // Text stays legible when the encoder is squeezed; the alternative is a
   // smooth but unreadable blur.
   if ('contentHint' in video) video.contentHint = 'detail'
+  return video
+}
 
-  const audio = withSystemAudio ? (stream.getAudioTracks()[0] ?? null) : null
-  if (audio && 'contentHint' in audio) audio.contentHint = 'music'
-
-  return { video, audio }
+/**
+ * Re-apply frame rate and resolution to a share that is already running.
+ *
+ * Changing either in settings mid-share and having nothing happen until the
+ * next one is the kind of control people conclude is broken, so this is applied
+ * live. A driver that refuses is not worth interrupting a call over.
+ */
+export async function retuneScreen(
+  track: MediaStreamTrack,
+  frameRate: number,
+  height: number,
+): Promise<void> {
+  try {
+    await track.applyConstraints(screenConstraints(frameRate, height))
+  } catch (error) {
+    console.warn('The share kept its previous capture settings', error)
+  }
 }
 
 /**

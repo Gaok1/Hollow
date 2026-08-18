@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
-import { useStore } from '../store'
+import { BROADCAST_GAIN_MAX, systemAudioWanted, useStore } from '../store'
 import { MIC_BOOST_MAX, MIC_BOOST_MIN, listDevices } from '../lib/media'
+import type { Settings } from '../store'
 import type { AppAudioSession } from '../types'
 import { useMicLevel } from './controls'
 import { CloseIcon, SpeakerIcon, SpeakerOffIcon } from './icons'
+import { Slider } from './slider'
 
 /** A peak meter. Rendered as a bar rather than a number: nobody reads dBFS. */
 function Meter({ level, active }: { level: number; active: boolean }) {
@@ -17,32 +19,13 @@ function Meter({ level, active }: { level: number; active: boolean }) {
   )
 }
 
-function SessionRow({ session }: { session: AppAudioSession }) {
-  const mixer = useStore((s) => s.mixer)
+function SessionRow({ session, perProcess }: { session: AppAudioSession; perProcess: boolean }) {
   const gains = useStore((s) => s.gains)
   const setGain = useStore((s) => s.setGain)
-  const setSessionVolume = useStore((s) => s.setSessionVolume)
 
-  const perProcess = mixer?.mode === 'perProcess'
-
-  // In per-process mode the slider is a broadcast gain Hollow owns. Otherwise
-  // it is the Windows session volume, which is shared with everything else on
-  // the machine — including what the user hears.
   const gain = gains[session.pid]?.gain ?? (session.broadcast ? 1 : 0)
-  const muted = perProcess ? (gains[session.pid]?.muted ?? false) : session.muted
-  const value = perProcess ? gain : session.volume
-
-  const onValue = (next: number) => {
-    if (perProcess) void setGain(session.pid, next, muted)
-    else void setSessionVolume(session.pid, next, muted)
-  }
-
-  const onMute = () => {
-    if (perProcess) void setGain(session.pid, gain, !muted)
-    else void setSessionVolume(session.pid, session.volume, !session.muted)
-  }
-
-  const included = perProcess ? !muted && gain > 0 : true
+  const muted = gains[session.pid]?.muted ?? false
+  const included = !muted && gain > 0
 
   return (
     <li className={`session ${session.active ? '' : 'session--idle'}`}>
@@ -75,22 +58,27 @@ function SessionRow({ session }: { session: AppAudioSession }) {
 
         <Meter level={session.peak} active={session.active && !muted} />
 
-        <div className="session__controls">
-          <button className="iconbtn" onClick={onMute} aria-label={muted ? 'Unmute' : 'Mute'}>
-            {muted ? <SpeakerOffIcon size={14} /> : <SpeakerIcon size={14} />}
-          </button>
-          <input
-            className="slider"
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={value}
-            onChange={(e) => onValue(Number(e.target.value))}
-            disabled={muted}
-          />
-          <span className="session__value">{Math.round(value * 100)}</span>
-        </div>
+        {perProcess ? (
+          <div className="session__controls">
+            <button
+              className="iconbtn"
+              onClick={() => setGain(session.pid, gain, !muted)}
+              aria-label={muted ? 'Unmute in the broadcast' : 'Mute in the broadcast'}
+            >
+              {muted ? <SpeakerOffIcon size={14} /> : <SpeakerIcon size={14} />}
+            </button>
+            <Slider
+              min={0}
+              max={1}
+              value={gain}
+              disabled={muted}
+              onChange={(next) => void setGain(session.pid, next, muted)}
+            />
+            <span className="session__value">{Math.round(gain * 100)}</span>
+          </div>
+        ) : (
+          session.muted && <span className="session__note">Muted in Windows</span>
+        )}
       </div>
     </li>
   )
@@ -100,14 +88,17 @@ export function MixerPanel() {
   const open = useStore((s) => s.mixerOpen)
   const mixer = useStore((s) => s.mixer)
   const info = useStore((s) => s.info)
+  const sharing = useStore((s) => s.localPresence.sharingScreen)
+  const settings = useStore((s) => s.settings)
   const toggle = useStore((s) => s.toggle)
+  const update = useStore((s) => s.updateSettings)
   const setMasterGain = useStore((s) => s.setMasterGain)
-  const [master, setMaster] = useState(1)
 
   if (!open) return null
 
   const perProcess = info?.capabilities.perProcessCapture ?? false
   const sessions = mixer?.sessions ?? []
+  const sending = systemAudioWanted(settings.systemAudio, perProcess)
 
   return (
     <aside className="panel">
@@ -118,33 +109,47 @@ export function MixerPanel() {
         </button>
       </header>
 
+      <div className="master__row">
+        <label className="switch" title="Send this machine's audio with the share">
+          <input
+            type="checkbox"
+            checked={sending}
+            onChange={(e) => update({ systemAudio: e.target.checked ? 'on' : 'off' })}
+          />
+          <span className="switch__track">
+            <span className="switch__thumb" />
+          </span>
+        </label>
+        <span className="master__label">Send system audio</span>
+      </div>
+
+      {/* Nothing here writes a Windows volume: every gain below is applied on
+          the way out, in the daemon's mixer thread. What this machine plays is
+          left exactly as the user set it. */}
       <p className={`notice ${perProcess ? '' : 'notice--warn'}`}>
-        {info?.capabilities.note}
+        {perProcess
+          ? 'Each app can be included on its own, and the levels here change only what the others hear.'
+          : 'This Windows build cannot capture applications separately, so the only thing available to send is the whole output — which includes the call itself, and comes back to everyone as an echo. Per-app control needs Windows build 20348 or later.'}
       </p>
 
-      {perProcess && (
+      {sending && (
         <div className="master">
           <span className="master__label">Master</span>
-          <Meter level={mixer?.masterPeak ?? 0} active />
-          <input
-            className="slider"
-            type="range"
+          <Meter level={mixer?.masterPeak ?? 0} active={sharing} />
+          <Slider
             min={0}
-            max={1.5}
-            step={0.01}
-            value={master}
-            onChange={(e) => {
-              const next = Number(e.target.value)
-              setMaster(next)
-              void setMasterGain(next)
-            }}
+            max={BROADCAST_GAIN_MAX}
+            value={settings.broadcastGain}
+            onChange={(next) => void setMasterGain(next)}
+            aria-label="Broadcast volume"
           />
+          <span className="session__value">{Math.round(settings.broadcastGain * 100)}</span>
         </div>
       )}
 
       <ul className="sessions">
         {sessions.map((session) => (
-          <SessionRow key={session.id} session={session} />
+          <SessionRow key={session.id} session={session} perProcess={perProcess} />
         ))}
       </ul>
 
@@ -153,6 +158,8 @@ export function MixerPanel() {
           No applications are playing audio right now. Start something and it will appear here.
         </p>
       )}
+
+      <p className="field__hint">{info?.capabilities.note}</p>
     </aside>
   )
 }
@@ -220,6 +227,7 @@ export function SettingsPanel() {
   const mic = useStore((s) => s.local.mic)
   const micMuted = useStore((s) => s.localPresence.micMuted)
   const micLevel = useMicLevel()
+  const perProcess = info?.capabilities.perProcessCapture ?? false
   const [devices, setDevices] = useState<Awaited<ReturnType<typeof listDevices>> | null>(null)
   const [copied, setCopied] = useState(false)
 
@@ -264,15 +272,13 @@ export function SettingsPanel() {
       <section className="field">
         <label htmlFor="boost">Microphone boost</label>
         <div className="boost">
-          <input
+          <Slider
             id="boost"
-            className="slider"
-            type="range"
             min={MIC_BOOST_MIN}
             max={MIC_BOOST_MAX}
             step={0.05}
             value={settings.micBoost}
-            onChange={(e) => setMicBoost(Number(e.target.value))}
+            onChange={setMicBoost}
           />
           <span className="boost__value">{Math.round(settings.micBoost * 100)}%</span>
         </div>
@@ -318,9 +324,43 @@ export function SettingsPanel() {
           <option value={30}>30 fps — balanced</option>
           <option value={60}>60 fps — games and video</option>
         </select>
+        <label htmlFor="height">Screen share resolution</label>
+        <select
+          id="height"
+          value={settings.screenHeight}
+          onChange={(e) => update({ screenHeight: Number(e.target.value) })}
+        >
+          <option value={0}>Whatever the display is</option>
+          <option value={1440}>1440p</option>
+          <option value={1080}>1080p</option>
+          <option value={900}>900p</option>
+          <option value={720}>720p — small text goes soft</option>
+          <option value={540}>540p — motion over detail</option>
+        </select>
         <p className="field__hint">
-          Higher frame rates spend the same bandwidth on more, blurrier frames. Text stays sharpest
-          at 15.
+          Frame rate and resolution spend the same bandwidth, so one is bought with the other. Text
+          stays sharpest tall and slow; a game reads better short and fast. Both apply to a share
+          already running.
+        </p>
+      </section>
+
+      <section className="field">
+        <label htmlFor="sysaudio">System audio in a share</label>
+        <select
+          id="sysaudio"
+          value={settings.systemAudio}
+          onChange={(e) => update({ systemAudio: e.target.value as Settings['systemAudio'] })}
+        >
+          <option value="auto">
+            Automatic — {perProcess ? 'sent, app by app' : 'not sent on this build'}
+          </option>
+          <option value="on">Always send it</option>
+          <option value="off">Never send it</option>
+        </select>
+        <p className="field__hint">
+          {perProcess
+            ? 'This build can capture applications one at a time, so the mixer decides which of them the others hear. Nothing here changes what you hear.'
+            : 'Windows only offers this build the whole output, and the call is playing into it — so sending it means everyone hears themselves a moment late. Turn it on for a moment if a game matters more than that; the mixer is where it lives while a share is running.'}
         </p>
       </section>
 
